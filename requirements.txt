@@ -1,0 +1,23 @@
+# Jarvis MVP Requirements
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+pydantic==2.5.3
+pydantic-settings==2.1.0
+
+# Database
+motor==3.3.2
+redis[hiredis]==5.0.1
+qdrant-client==1.7.0
+
+# Task Queue
+celery==5.3.4
+
+# Browser Automation
+playwright==1.40.0
+
+# LLM & AI (placeholders for future)
+# openai==1.10.0
+# anthropic==0.8.1
+
+# Utilities
+python-jose[cryptography]==3.3.0

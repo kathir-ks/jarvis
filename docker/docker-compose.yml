@@ -1,0 +1,90 @@
+version: "3.8"
+
+services:
+  mongodb:
+    image: mongo:7.0
+    container_name: jarvis-mongodb
+    restart: unless-stopped
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo-data:/data/db
+    environment:
+      MONGO_INITDB_DATABASE: jarvis
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7.2-alpine
+    container_name: jarvis-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  qdrant:
+    image: qdrant/qdrant:v1.7.4
+    container_name: jarvis-qdrant
+    restart: unless-stopped
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - qdrant-data:/qdrant/storage
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:6333/readyz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  api-gateway:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: jarvis-api-gateway
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      JARVIS_MONGO_DSN: mongodb://mongodb:27017
+      JARVIS_REDIS_URL: redis://redis:6379/0
+      JARVIS_QDRANT_URL: http://qdrant:6333
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+    command: uvicorn jarvis.app.main:app --host 0.0.0.0 --port 8000
+
+  task-executor:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: jarvis-task-executor
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      JARVIS_MONGO_DSN: mongodb://mongodb:27017
+      JARVIS_REDIS_URL: redis://redis:6379/0
+      JARVIS_QDRANT_URL: http://qdrant:6333
+    depends_on:
+      - mongodb
+      - redis
+      - qdrant
+    command: celery -A jarvis.app.tasks.celery_app worker --loglevel=info --concurrency=4
+
+volumes:
+  mongo-data:
+  qdrant-data:

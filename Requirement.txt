@@ -1,0 +1,124 @@
+This document describes the primary purpose and requirement of this software 
+framework. 
+
+Primary Objective:
+
+The primary objective of this software is to build personal agents for 
+individuals, that acts like a Jarvis system. It should be able to act 
+upon the users tasks, communicate with the other agents that belong to 
+other individuals, surf the internet and acts as a copilot to the users. 
+
+Capabilities of the Agent:
+
+-> Perform tasks for individuals such as exploration, research, 
+online e-commerce tasks such as ordering products, searching for commodities, 
+booking tickets. 
+-> It not only acts on tasks that are created by the users. It should act
+on its own, surf the internet and other social or commercial platforms, 
+find the relevant products that the users will like. 
+-> The term "relevant products" can refer to anything. It can a product, movies, 
+songs or entertainment content, techincal blogs, news, events, or similar. 
+-> It should be able to understand the users behaviour, character and the likes
+/dislikes over time. 
+
+Multi-Agent Communication:
+
+-> Agents to agent communication can be of two major types. 
+-> One is between agents that belong to a single user/entity. 
+-> Another is between agents of different users/entities. 
+-> There should be one primary or master agent per users
+and there can be sub-agents, if in case needed, they can 
+be designated for specific tasks. 
+-> Both the users and the master agents should be able to manage
+the life cycle of the sub-agents. 
+-> It should create a standard interface for agent to agent communication. 
+The platform which runs these agents should be able to facilitate these
+interface based communications. 
+-> The platform should also expose these interfaces so that similar 
+external agents/platforms should be able to communication. This can
+be implemented later but should be considered while designing. 
+
+Automony Level:
+
+-> This depends on the specific context and usage. 
+-> For tasks that are related to booking / ordering 
+the user approval is definitely needed. 
+-> For tasks that are more of exploration for such 
+products and other entities, the agent should act
+on its own, taking its own decisions. 
+
+Platform integrations:
+
+-> It should have the ability to integrate with e-commerce 
+platforms, entertainment platform, should be able to search 
+the internet and visit websites. 
+-> It should have a standard mechanism in the platform 
+to perform these activities. 
+
+Authentication:
+
+-> An new Authentication mechanism should be developed on top of 
+or in integration with the existing Authentication mechanisms such 
+as OAUth, or such to create authentication profiles for agents. 
+
+It should primarily run in the cloud, meaning it should run async 
+even if the users is not actively using it. It should be operating 
+for a long time, on its own, exploring the internet for the users. 
+It should also use the time it interacts with the users to build a 
+profile of the users over time. 
+
+
+Functional requirements:
+
+Data Storage: 
+The raw data - the user message, the llm/agent output, tasks, 
+agent states, task states, messages / communication between 
+agents should be stored in NoSQL DB. Vectors should be used 
+for messages, searching content through similarity search. 
+
+User Interface:
+
+Built the core platform in a way that it exposes standard interfaces. 
+We can use web and mobile platforms to user interface. 
+
+Notification:
+We can use the push notifications to the app. 
+
+Concurrency:
+-> The subagents can execute in parallel based on the workflow or if
+the tasks allows. 
+
+
+Non-Functional Requirements:
+
+Performance:
+The platform should be built in a distributed manner, where there
+should be clear segregation. 
+
+The agent should be executed in a isolated or different workloads/services
+and the platform should be running continuously. Think of the platform 
+as a controller or orchestrator that runs continuously. 
+
+Scalability:
+
+It should be designed in a modular way. It should scale to any number
+of users. 
+The platform is a common point where the users and the agents exist. 
+The agents should be run in workloads. Then the agent tasks should be 
+run in separated or isolated context / runtimes. 
+
+Observability:
+Logs/Traces should be used for observing the agent as well as 
+platform behaviour. 
+
+LLM API:
+
+The llm calling should have a interface system where both self hosted 
+and API based models should be plugged in. 
+Create own tool calling / tool intergration mechanism. Also use MCP 
+integration points. 
+
+We should use both short term context and long term memory profile of 
+an user. 
+
+
