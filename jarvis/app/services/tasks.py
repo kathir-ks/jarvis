@@ -44,7 +44,7 @@ class TaskService:
         
         return TaskResponse(
             task_id=task.task_id,
-            status=task.status.value,
+            status=task.status,
             priority=task.priority,
         )
 
@@ -56,7 +56,7 @@ class TaskService:
         
         return TaskResponse(
             task_id=task.task_id,
-            status=task.status.value,
+            status=task.status,
             priority=task.priority,
             result=task.result,
             error=task.error,
@@ -72,6 +72,6 @@ class TaskService:
         
         return TaskResponse(
             task_id=task.task_id,
-            status=task.status.value,
+            status=task.status,
             priority=task.priority,
         )

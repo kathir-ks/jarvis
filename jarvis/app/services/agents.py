@@ -39,8 +39,8 @@ class AgentService:
         
         return AgentResponse(
             agent_id=agent.agent_id,
-            agent_type=agent.agent_type.value,
-            status=agent.status.value,
+            agent_type=agent.agent_type,
+            status=agent.status,
             parent_agent_id=agent.parent_agent_id,
             user_id=agent.user_id,
             config=agent.config.model_dump(),
@@ -55,8 +55,8 @@ class AgentService:
         
         return AgentResponse(
             agent_id=agent.agent_id,
-            agent_type=agent.agent_type.value,
-            status=agent.status.value,
+            agent_type=agent.agent_type,
+            status=agent.status,
             parent_agent_id=agent.parent_agent_id,
             user_id=agent.user_id,
             config=agent.config.model_dump(),

@@ -1,4 +1,6 @@
 """Celery task executors with MongoDB persistence and callbacks."""
+import asyncio
+import json
 import logging
 from typing import Any
 
@@ -216,11 +218,13 @@ def _trigger_callback(task_id: str, callback_type: str, data: dict[str, Any]) ->
         agent_id = task_doc.get("agent_id")
         if agent_id:
             redis_client = get_redis_client()
-            redis_client.publish(
-                f"agent:{agent_id}:inbox",
-                str({"type": "task_callback", "task_id": task_id, "data": data})
-            )
-            logger.info(f"Triggered {callback_type} callback for task {task_id}")
+            message = {"type": "task_callback", "task_id": task_id, "data": data}
+
+            async def _publish():
+                await redis_client.publish(f"agent:{agent_id}:inbox", json.dumps(message))
+
+            asyncio.run(_publish())
+            logger.info("Triggered %s callback for task %s", callback_type, task_id)
             
     except Exception as e:
         logger.error(f"Failed to trigger callback for task {task_id}: {e}")

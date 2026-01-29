@@ -21,6 +21,10 @@ async def create_agent(
         return await service.create_agent(payload)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Internal error: {str(e)}")
 
 
 @router.get("/{agent_id}", response_model=AgentResponse)

@@ -18,6 +18,12 @@ class Settings(BaseSettings):
 
     qdrant_url: str = Field("http://qdrant:6333", description="Qdrant HTTP endpoint")
 
+    default_llm_provider: str = Field("openai", description="Default LLM provider")
+    default_llm_model: str = Field("gpt-4o-mini", description="Default LLM model name")
+    openai_api_key: str | None = Field(None, description="OpenAI API key for LLM calls")
+    gemini_api_key: str | None = Field(None, description="Google Gemini API key for LLM calls")
+    default_gemini_model: str = Field("gemini-2.0-flash-exp", description="Default Gemini model name")
+
     max_concurrent_tasks_per_user: int = Field(25, description="Task concurrency guard per user")
     task_max_duration_seconds: int = Field(300, description="Default task timeout")
     task_max_retries: int = Field(3, description="Default task retries")
@@ -28,6 +34,8 @@ class Settings(BaseSettings):
     class Config:
         env_prefix = "JARVIS_"
         case_sensitive = False
+        env_file = ".env"
+        env_file_encoding = "utf-8"
 
 
 @lru_cache(maxsize=1)

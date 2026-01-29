@@ -18,7 +18,14 @@ async def submit_task_for_agent(
     service: TaskService = Depends(get_task_service),
 ):
     """Submit a new task for an agent (use query param ?agent_id=...)."""
-    return await service.submit_task(agent_id, payload)
+    try:
+        return await service.submit_task(agent_id, payload)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Internal error: {str(e)}")
 
 
 @router.get("/{task_id}", response_model=TaskResponse)

@@ -34,6 +34,10 @@ class AgentConfig(BaseModel):
     loop_interval_seconds: int = 1
     checkpoint_interval_seconds: int = 30
 
+    # MCP Configuration (optional)
+    mcp_server_url: str | None = None  # If set, agent will use MCP for tools
+    mcp_timeout_seconds: int = 30  # Timeout for MCP requests
+
 
 class Agent(BaseModel):
     """Core Agent entity."""
