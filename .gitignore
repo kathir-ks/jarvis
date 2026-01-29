@@ -44,3 +44,6 @@ htmlcov/
 dist/
 build/
 *.egg-info/
+
+# Claude Code
+.claude/
