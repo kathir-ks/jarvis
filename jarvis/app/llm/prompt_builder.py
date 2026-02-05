@@ -1,10 +1,15 @@
 """Prompt construction utilities for agent conversations."""
 from __future__ import annotations
 
+import logging
 from datetime import datetime
 from typing import Any
 
 from ..runtime.agent import Agent
+from .token_counter import get_token_counter
+from ..runtime.memory_selector import get_memory_selector
+
+logger = logging.getLogger(__name__)
 
 
 class PromptBuilder:
@@ -15,6 +20,11 @@ class PromptBuilder:
         "for your user. Always explain your reasoning, cite facts, and highlight when human approval is required "
         "for purchases or bookings. Provide concise, actionable responses."
     )
+
+    def __init__(self):
+        """Initialize prompt builder with token counter and memory selector."""
+        self.token_counter = get_token_counter()
+        self.memory_selector = get_memory_selector()
 
     def build_agent_messages(
         self,
@@ -71,6 +81,152 @@ class PromptBuilder:
 
         user_content = self._format_incoming(incoming_message)
         messages = [*system_messages, {"role": "user", "content": user_content}]
+        return messages
+
+    def build_agent_messages_with_budget(
+        self,
+        agent: Agent,
+        incoming_message: dict[str, Any],
+        long_term_context: dict[str, list[Any]] | None = None,
+        model: str = "gpt-4",
+        tools: list[dict[str, Any]] | None = None,
+    ) -> list[dict[str, str]]:
+        """
+        Build chat completion messages with token budget management.
+
+        Uses intelligent memory selection and token-aware truncation to ensure
+        messages fit within model context window.
+
+        Args:
+            agent: The agent entity
+            incoming_message: The incoming message payload
+            long_term_context: Optional long-term memory context from vector store
+            model: Model name for token counting
+            tools: Optional tool definitions for budget calculation
+
+        Returns:
+            List of chat messages for LLM, guaranteed to fit in context window
+        """
+        # Get token budget breakdown
+        budget = self.token_counter.get_token_budget_breakdown(model)
+
+        logger.info(
+            f"Building prompt with budget - Model: {model}, "
+            f"Total window: {budget['total_window']}, "
+            f"Available: {budget['available']}"
+        )
+
+        # Build system prompt
+        system_messages = [
+            {"role": "system", "content": self.BASE_SYSTEM_PROMPT},
+        ]
+
+        # Format incoming message
+        user_content = self._format_incoming(incoming_message)
+
+        # Calculate tool tokens if provided
+        tool_tokens = 0
+        if tools:
+            tool_tokens = self.token_counter.estimate_tool_tokens(tools, model)
+            logger.debug(f"Tool tokens: {tool_tokens}")
+
+        # Calculate remaining budget after system prompt, tools, and current message
+        system_tokens = self.token_counter.count_messages_tokens(system_messages, model)
+        current_msg_tokens = self.token_counter.count_tokens(user_content, model)
+
+        remaining_budget = (
+            budget["available"]
+            - system_tokens
+            - tool_tokens
+            - current_msg_tokens
+            - budget["reserve"]
+        )
+
+        logger.debug(
+            f"Token allocation - System: {system_tokens}, Tools: {tool_tokens}, "
+            f"Current: {current_msg_tokens}, Remaining: {remaining_budget}"
+        )
+
+        # Allocate remaining budget between short-term and long-term memory
+        short_term_budget = int(remaining_budget * 0.55)  # 55% for short-term
+        long_term_budget = int(remaining_budget * 0.45)   # 45% for long-term
+
+        # Select relevant short-term memories within budget
+        if agent.short_term_memory:
+            selected_memories = self.memory_selector.select_short_term_memories(
+                memories=agent.short_term_memory,
+                query=user_content,
+                max_count=10,
+                max_tokens=short_term_budget,
+                estimate_tokens_func=lambda m: self.token_counter.count_tokens(m, model),
+            )
+
+            if selected_memories:
+                memory_text = self._format_selected_memories(selected_memories)
+                memory_tokens = self.token_counter.count_tokens(memory_text, model)
+                logger.debug(
+                    f"Selected {len(selected_memories)} memories "
+                    f"using {memory_tokens}/{short_term_budget} tokens"
+                )
+
+                system_messages.append({
+                    "role": "system",
+                    "content": f"Recent conversation history:\n{memory_text}",
+                })
+
+        # Add long-term memory context if available
+        if long_term_context:
+            long_term_text = self._summarize_long_term_context_with_budget(
+                context=long_term_context,
+                max_tokens=long_term_budget,
+                model=model,
+            )
+
+            if long_term_text:
+                long_term_tokens = self.token_counter.count_tokens(long_term_text, model)
+                logger.debug(
+                    f"Long-term memory using {long_term_tokens}/{long_term_budget} tokens"
+                )
+
+                system_messages.append({
+                    "role": "system",
+                    "content": f"Relevant long-term memory:\n{long_term_text}",
+                })
+
+        # Add current agent context (with budget constraint)
+        context_text = self._summarize_context(agent)
+        if context_text:
+            context_tokens = self.token_counter.count_tokens(context_text, model)
+            # Truncate if too large
+            if context_tokens > budget["reserve"]:
+                context_text = context_text[: budget["reserve"] * 4]  # Approx 4 chars/token
+                context_text += "..."
+
+            system_messages.append({
+                "role": "system",
+                "content": f"Current session context:\n{context_text}",
+            })
+
+        # Build final messages
+        messages = [*system_messages, {"role": "user", "content": user_content}]
+
+        # Verify we're within budget
+        total_tokens = self.token_counter.count_messages_tokens(messages, model)
+        total_with_tools = total_tokens + tool_tokens
+
+        if total_with_tools > budget["available"]:
+            logger.warning(
+                f"Prompt exceeds budget ({total_with_tools} > {budget['available']}). "
+                "Applying emergency truncation."
+            )
+            messages = self._emergency_truncate(messages, budget["available"], model)
+
+        final_tokens = self.token_counter.count_messages_tokens(messages, model)
+        logger.info(
+            f"Final prompt: {final_tokens} tokens "
+            f"(+{tool_tokens} tools = {final_tokens + tool_tokens} total)"
+        )
+
         return messages
 
     def _summarize_short_term_memory(self, agent: Agent) -> str:
@@ -162,6 +318,156 @@ class PromptBuilder:
             meta_text = f"\nMetadata: {meta_kv}"
 
         return f"{header}\n\n{body}{meta_text}"
+
+    def _format_selected_memories(self, memories: list[dict[str, Any]]) -> str:
+        """
+        Format selected memories for prompt inclusion.
+
+        Args:
+            memories: Selected memory items
+
+        Returns:
+            Formatted string representation
+        """
+        if not memories:
+            return ""
+
+        formatted = []
+        for item in memories:
+            role = item.get("role") or item.get("type", "note")
+            content = item.get("content")
+            timestamp = item.get("timestamp")
+
+            # Keep full content (already selected within budget)
+            formatted.append(f"[{role}] {content} ({timestamp})")
+
+        return "\n".join(formatted)
+
+    def _summarize_long_term_context_with_budget(
+        self,
+        context: dict[str, list[Any]],
+        max_tokens: int,
+        model: str,
+    ) -> str:
+        """
+        Summarize long-term memory context within token budget.
+
+        Args:
+            context: Long-term context dict
+            max_tokens: Maximum tokens to use
+            model: Model name for token counting
+
+        Returns:
+            Formatted summary within budget
+        """
+        parts = []
+        tokens_used = 0
+
+        # Helper to add part if it fits
+        def add_part_if_fits(part: str) -> bool:
+            nonlocal tokens_used
+            part_tokens = self.token_counter.count_tokens(part, model)
+            if tokens_used + part_tokens <= max_tokens:
+                parts.append(part)
+                tokens_used += part_tokens
+                return True
+            return False
+
+        # Add interactions
+        interactions = context.get("interactions", [])
+        if interactions and add_part_if_fits("== Related Past Interactions =="):
+            for entry in interactions[:5]:  # Up to 5 interactions
+                content = entry.content if hasattr(entry, "content") else entry.get("content", "")
+                score = entry.score if hasattr(entry, "score") else entry.get("score", 0)
+
+                # Truncate if needed
+                if isinstance(content, str) and len(content) > 200:
+                    content = content[:200] + "..."
+
+                interaction_str = f"- {content} (relevance: {score:.2f})"
+                if not add_part_if_fits(interaction_str):
+                    break  # Stop if we run out of budget
+
+        # Add discoveries
+        discoveries = context.get("discoveries", [])
+        if discoveries and add_part_if_fits("\n== Related Discoveries =="):
+            for entry in discoveries[:3]:
+                content = entry.content if hasattr(entry, "content") else entry.get("content", "")
+                metadata = entry.metadata if hasattr(entry, "metadata") else entry.get("metadata", {})
+                source = metadata.get("source", "unknown")
+
+                if isinstance(content, str) and len(content) > 150:
+                    content = content[:150] + "..."
+
+                discovery_str = f"- [{source}] {content}"
+                if not add_part_if_fits(discovery_str):
+                    break
+
+        # Add knowledge
+        knowledge = context.get("knowledge", [])
+        if knowledge and add_part_if_fits("\n== Relevant Knowledge =="):
+            for entry in knowledge[:3]:
+                content = entry.content if hasattr(entry, "content") else entry.get("content", "")
+                metadata = entry.metadata if hasattr(entry, "metadata") else entry.get("metadata", {})
+                knowledge_type = metadata.get("knowledge_type", "fact")
+
+                if isinstance(content, str) and len(content) > 150:
+                    content = content[:150] + "..."
+
+                knowledge_str = f"- [{knowledge_type}] {content}"
+                if not add_part_if_fits(knowledge_str):
+                    break
+
+        logger.debug(f"Long-term summary used {tokens_used}/{max_tokens} tokens")
+        return "\n".join(parts) if parts else ""
+
+    def _emergency_truncate(
+        self,
+        messages: list[dict[str, str]],
+        max_tokens: int,
+        model: str,
+    ) -> list[dict[str, str]]:
+        """
+        Emergency truncation when prompt exceeds budget.
+
+        Removes oldest memories first, preserving system prompt and current message.
+
+        Args:
+            messages: Current messages
+            max_tokens: Maximum allowed tokens
+            model: Model name
+
+        Returns:
+            Truncated messages
+        """
+        # Separate system, memory, and user messages
+        system_msg = messages[0] if messages else None
+        user_msg = messages[-1] if messages else None
+        middle_messages = messages[1:-1] if len(messages) > 2 else []
+
+        if not system_msg or not user_msg:
+            return messages
+
+        # Start with just system and user
+        truncated = [system_msg, user_msg]
+        current_tokens = self.token_counter.count_messages_tokens(truncated, model)
+
+        # Add middle messages from most recent to oldest until we hit budget
+        for msg in reversed(middle_messages):
+            msg_tokens = self.token_counter.count_tokens(msg, model)
+            if current_tokens + msg_tokens <= max_tokens:
+                # Insert before user message
+                truncated.insert(-1, msg)
+                current_tokens += msg_tokens
+            else:
+                logger.warning("Dropping message to fit budget")
+
+        logger.info(
+            f"Emergency truncation: {len(messages)} → {len(truncated)} messages, "
+            f"{current_tokens}/{max_tokens} tokens"
+        )
+
+        return truncated
 
     @staticmethod
     def _fmt_time(value: Any) -> str:

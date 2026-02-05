@@ -420,12 +420,14 @@ class VectorMemoryService:
         interaction_limit: int = 5,
         discovery_limit: int = 3,
         knowledge_limit: int = 3,
+        recency_weight: float = 0.3,
     ) -> dict[str, list[MemoryEntry]]:
         """
-        Get relevant context for agent reasoning.
-        
+        Get relevant context for agent reasoning with time-weighted scoring.
+
         Combines recent interactions, related discoveries, and relevant knowledge.
-        
+        Applies time decay to favor more recent memories.
+
         Args:
             user_id: User identifier
             agent_id: Agent identifier
@@ -433,46 +435,81 @@ class VectorMemoryService:
             interaction_limit: Max recent interactions
             discovery_limit: Max related discoveries
             knowledge_limit: Max relevant knowledge
-        
+            recency_weight: Weight for time decay (0.0-1.0, default 0.3)
+                           Higher values favor more recent memories
+
         Returns:
             Dict with 'interactions', 'discoveries', 'knowledge' lists
         """
+        import math
+
         context = {
             "interactions": [],
             "discoveries": [],
             "knowledge": [],
         }
-        
+
         # If no query, use a generic context query
         search_query = query or "recent context and relevant information"
-        
+
         try:
             # Get recent interactions
             interactions = await self.search_interactions(
                 query=search_query,
                 user_id=user_id,
                 agent_id=agent_id,
-                limit=interaction_limit,
-                score_threshold=0.3,
+                limit=interaction_limit * 2,  # Get more, then re-rank
+                score_threshold=0.2,  # Lower threshold for time-weighted re-ranking
             )
-            context["interactions"] = interactions.entries
+
+            # Apply time-weighted re-ranking
+            now = datetime.utcnow()
+            for entry in interactions.entries:
+                age_days = (now - entry.timestamp).total_seconds() / 86400
+                # Exponential decay: half-life of 7 days
+                time_decay = math.exp(-age_days / 7)
+
+                # Combine similarity score with time decay
+                entry.score = (
+                    entry.score * (1 - recency_weight) +
+                    time_decay * recency_weight
+                )
+
+            # Re-sort by adjusted score and limit
+            interactions.entries.sort(key=lambda e: e.score, reverse=True)
+            context["interactions"] = interactions.entries[:interaction_limit]
+
         except Exception as e:
             logger.warning("Failed to retrieve interactions: %s", e)
-        
+
         try:
-            # Get related discoveries
+            # Get related discoveries (with time weighting)
             discoveries = await self.search_discoveries(
                 query=search_query,
                 user_id=user_id,
-                limit=discovery_limit,
-                score_threshold=0.4,
+                limit=discovery_limit * 2,
+                score_threshold=0.2,
             )
-            context["discoveries"] = discoveries.entries
+
+            # Apply time-weighted re-ranking
+            now = datetime.utcnow()
+            for entry in discoveries.entries:
+                age_days = (now - entry.timestamp).total_seconds() / 86400
+                time_decay = math.exp(-age_days / 7)
+
+                entry.score = (
+                    entry.score * (1 - recency_weight) +
+                    time_decay * recency_weight
+                )
+
+            discoveries.entries.sort(key=lambda e: e.score, reverse=True)
+            context["discoveries"] = discoveries.entries[:discovery_limit]
+
         except Exception as e:
             logger.warning("Failed to retrieve discoveries: %s", e)
-        
+
         try:
-            # Get relevant knowledge
+            # Get relevant knowledge (time decay less important for facts)
             knowledge = await self.search_knowledge(
                 query=search_query,
                 agent_id=agent_id,
@@ -480,9 +517,17 @@ class VectorMemoryService:
                 score_threshold=0.4,
             )
             context["knowledge"] = knowledge.entries
+
         except Exception as e:
             logger.warning("Failed to retrieve knowledge: %s", e)
-        
+
+        logger.info(
+            f"Retrieved context with time weighting (recency_weight={recency_weight}): "
+            f"{len(context['interactions'])} interactions, "
+            f"{len(context['discoveries'])} discoveries, "
+            f"{len(context['knowledge'])} knowledge entries"
+        )
+
         return context
     
     async def delete_by_agent(self, agent_id: str) -> int:

@@ -18,6 +18,7 @@ playwright==1.40.0
 # LLM & AI
 openai==1.52.2
 google-generativeai==0.8.3
+tiktoken==0.8.0  # Token counting for context management
 # anthropic==0.8.1
 
 # Utilities

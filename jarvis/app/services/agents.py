@@ -67,10 +67,11 @@ class AgentService:
         """Start agent event loop in background."""
         if agent_id in self.active_runners:
             raise ValueError(f"Agent {agent_id} is already running")
-        
-        runner = AgentRunner(agent_id)
+
+        # Pass self to allow master agents to spawn sub-agents
+        runner = AgentRunner(agent_id, agent_service=self)
         self.active_runners[agent_id] = runner
-        
+
         # Start in background (non-blocking)
         import asyncio
         asyncio.create_task(runner.run())

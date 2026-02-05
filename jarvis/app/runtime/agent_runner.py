@@ -5,7 +5,7 @@ import asyncio
 import json
 import logging
 from datetime import datetime
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 from ..db.redis_client import get_redis_client
 from ..db.repositories import AgentRepository, TaskRepository
@@ -16,9 +16,13 @@ from ..llm.tool_registry import get_tool_registry, ToolRegistry
 from ..mcp.client import MCPClient
 from ..messaging.broker import MessageBroker
 from ..tasks.task_executors import submit_task_to_celery
-from .agent import Agent, AgentStatus
+from .agent import Agent, AgentStatus, AgentType
 from .dag_executor import DAGExecutor
 from .task import Task, TaskStatus
+from .master_agent import MasterAgentOrchestrator
+
+if TYPE_CHECKING:
+    from ..services.agents import AgentService
 
 logger = logging.getLogger(__name__)
 
@@ -26,7 +30,7 @@ logger = logging.getLogger(__name__)
 class AgentRunner:
     """Agent event loop with message handling, task execution, and state persistence."""
 
-    def __init__(self, agent_id: str):
+    def __init__(self, agent_id: str, agent_service: "AgentService | None" = None):
         self.agent_id = agent_id
         self.running = False
 
@@ -46,6 +50,10 @@ class AgentRunner:
 
         # Vector Memory (long-term)
         self.vector_memory: VectorMemoryService | None = None
+
+        # Master Agent Orchestrator (initialized for MASTER agents in run())
+        self.master_orchestrator: MasterAgentOrchestrator | None = None
+        self._agent_service = agent_service
 
         # State
         self.agent: Agent | None = None
@@ -67,6 +75,16 @@ class AgentRunner:
             return
         
         logger.info(f"Agent {self.agent_id} starting event loop (type: {self.agent.agent_type})")
+
+        # Initialize master orchestrator for MASTER agents
+        if self.agent.agent_type == AgentType.MASTER:
+            self.master_orchestrator = MasterAgentOrchestrator(
+                agent_id=self.agent_id,
+                agent_service=self._agent_service,
+                llm_router=self.llm_router,
+                user_id=self.agent.user_id,
+            )
+            logger.info(f"Master orchestrator initialized for agent {self.agent_id}")
 
         # Initialize MCP client if configured
         if self.agent.config.mcp_server_url:
@@ -160,6 +178,18 @@ class AgentRunner:
             return
 
         payload = self._normalize_message(message)
+
+        # Check if this is a delegation request (for SUB_AGENT)
+        if payload.get("type") == "delegation_request":
+            if self.agent.agent_type == AgentType.SUB_AGENT:
+                await self._handle_delegation_request(payload)
+                return
+            else:
+                logger.warning(
+                    f"Non-sub-agent {self.agent_id} received delegation request - ignoring"
+                )
+                return
+
         user_content = payload.get("content") or str(payload)
         logger.info("Agent %s handling message: %s", self.agent_id, payload)
 
@@ -347,6 +377,150 @@ class AgentRunner:
                     },
                 },
             )
+
+    async def _handle_delegation_request(self, payload: dict[str, Any]) -> None:
+        """
+        Handle a delegation request from a master agent.
+
+        Executes the delegated subtask using LLM + tools and sends
+        the result back to the master agent via the reply channel.
+
+        Args:
+            payload: Delegation request payload containing:
+                - delegation_id: Unique delegation identifier
+                - master_agent_id: ID of the delegating master agent
+                - task: Subtask definition (subtask_id, description, priority)
+                - reply_channel: Channel for result response
+        """
+        if not self.agent:
+            return
+
+        delegation_id = payload.get("delegation_id")
+        master_agent_id = payload.get("master_agent_id")
+        task_info = payload.get("task", {})
+        reply_channel = payload.get("reply_channel")
+
+        logger.info(
+            f"Sub-agent {self.agent_id} handling delegation {delegation_id} "
+            f"from master {master_agent_id}"
+        )
+
+        start_time = datetime.utcnow()
+        subtask_description = task_info.get("description", "")
+        tool_calls_made = []
+
+        try:
+            # Build prompt for the subtask
+            llm_messages = self.prompt_builder.build_agent_messages(
+                self.agent,
+                {"content": subtask_description, "type": "delegation"},
+            )
+            llm_config = await self._build_llm_config()
+
+            # Execute with tool calling loop
+            max_iterations = 10
+            iteration = 0
+            final_response = ""
+
+            while iteration < max_iterations:
+                iteration += 1
+
+                llm_response = await self.llm_router.call(llm_messages, llm_config)
+
+                if llm_response.tool_calls:
+                    llm_messages.append({
+                        "role": "assistant",
+                        "content": llm_response.content or "",
+                        "tool_calls": llm_response.tool_calls,
+                    })
+
+                    # Execute tools
+                    for tool_call in llm_response.tool_calls:
+                        tool_name = tool_call["function"]["name"]
+                        tool_args_str = tool_call["function"]["arguments"]
+
+                        try:
+                            tool_args = json.loads(tool_args_str) if isinstance(tool_args_str, str) else tool_args_str
+                        except json.JSONDecodeError as e:
+                            tool_result_content = json.dumps({"error": f"Invalid JSON: {e}"})
+                        else:
+                            if self.mcp_client:
+                                try:
+                                    mcp_result = await self.mcp_client.call_tool(tool_name, tool_args)
+                                    tool_result_content = json.dumps(mcp_result.get("result", {}))
+                                except Exception as mcp_error:
+                                    tool_result_content = json.dumps({"error": str(mcp_error)})
+                            else:
+                                tool_result = await self.tool_registry.execute(tool_name, tool_args)
+                                if tool_result.success:
+                                    tool_result_content = json.dumps(tool_result.result)
+                                else:
+                                    tool_result_content = json.dumps({"error": tool_result.error})
+
+                        llm_messages.append({
+                            "role": "tool",
+                            "tool_call_id": tool_call["id"],
+                            "name": tool_name,
+                            "content": tool_result_content,
+                        })
+                        tool_calls_made.append({
+                            "name": tool_name,
+                            "args": tool_args if isinstance(tool_args, dict) else {},
+                        })
+
+                    continue
+
+                # No more tool calls - we have the final response
+                final_response = llm_response.content or ""
+                break
+
+            execution_time_ms = (datetime.utcnow() - start_time).total_seconds() * 1000
+
+            # Send result back to master agent
+            result_message = {
+                "type": "delegation_result",
+                "delegation_id": delegation_id,
+                "sub_agent_id": self.agent_id,
+                "status": "completed",
+                "result": {
+                    "subtask_id": task_info.get("subtask_id"),
+                    "output": final_response,
+                    "tool_calls": tool_calls_made,
+                    "execution_time_ms": execution_time_ms,
+                },
+                "error": None,
+                "timestamp": datetime.utcnow().isoformat(),
+            }
+
+            logger.info(
+                f"Delegation {delegation_id} completed in {execution_time_ms:.0f}ms "
+                f"with {len(tool_calls_made)} tool calls"
+            )
+
+        except Exception as e:
+            logger.error(f"Delegation {delegation_id} failed: {e}", exc_info=True)
+            execution_time_ms = (datetime.utcnow() - start_time).total_seconds() * 1000
+
+            result_message = {
+                "type": "delegation_result",
+                "delegation_id": delegation_id,
+                "sub_agent_id": self.agent_id,
+                "status": "failed",
+                "result": {
+                    "subtask_id": task_info.get("subtask_id"),
+                    "output": "",
+                    "tool_calls": tool_calls_made,
+                    "execution_time_ms": execution_time_ms,
+                },
+                "error": str(e),
+                "timestamp": datetime.utcnow().isoformat(),
+            }
+
+        # Publish result to reply channel
+        if reply_channel:
+            await self.message_broker.publish(reply_channel, result_message)
+        else:
+            logger.warning(f"No reply channel for delegation {delegation_id}")
 
     async def _execute_pending_tasks(self):
         """Fetch and execute pending tasks using DAG executor."""

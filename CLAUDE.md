@@ -2,6 +2,8 @@
 
 > **For Claude AI Context** - This document provides a comprehensive overview of the Jarvis Agent Platform's purpose, architecture, components, and design.
 
+> **📊 [Current State Assessment](CURRENT_STATE.md)** - For detailed module-by-module status, implementation progress, and quality ratings, see the current state document.
+
 ---
 
 ## 🎯 Application Purpose
@@ -534,6 +536,13 @@ jarvis/app/
 4. Follow the established repository pattern
 5. Add proper error handling and logging
 6. Update IMPLEMENTATION.md with progress
+7. **Update CURRENT_STATE.md** whenever significant changes or progress has been made:
+   - New modules or components added
+   - Major features completed or refactored
+   - Implementation status changes (e.g., Phase completion)
+   - Critical bugs fixed or security improvements
+   - Architecture changes or design decisions
+   - Update module status, quality ratings, and gaps sections
 
 ---
 
