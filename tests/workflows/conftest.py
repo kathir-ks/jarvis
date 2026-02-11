@@ -3,6 +3,7 @@ Shared fixtures for Gemini workflow tests.
 """
 import asyncio
 import pytest
+import pytest_asyncio
 from datetime import datetime
 from typing import Any, AsyncGenerator
 
@@ -10,14 +11,13 @@ from jarvis.app.runtime.agent import Agent, AgentConfig, AgentType, AgentStatus
 from jarvis.app.runtime.agent_runner import AgentRunner
 from jarvis.app.runtime.task import Task, TaskType, TaskStatus
 from jarvis.app.db.repositories import AgentRepository, TaskRepository
-from jarvis.app.db.mongo import get_mongo_client
 from jarvis.app.db.vector_memory import VectorMemoryService
 from jarvis.app.llm.router import LLMRouter
 from jarvis.app.llm.prompt_builder import PromptBuilder
 from jarvis.app.messaging.broker import MessageBroker
 
 
-@pytest.fixture
+@pytest_asyncio.fixture
 async def test_agent_config() -> AgentConfig:
     """Create test agent configuration for Gemini."""
     return AgentConfig(
@@ -31,41 +31,37 @@ async def test_agent_config() -> AgentConfig:
     )
 
 
-@pytest.fixture
+@pytest_asyncio.fixture
 async def agent_repository() -> AsyncGenerator[AgentRepository, None]:
     """Create agent repository with test database."""
-    client = await get_mongo_client()
-    db = client.jarvis_test
-    repo = AgentRepository(db)
+    repo = AgentRepository()
     yield repo
     # Cleanup
-    await db.agents.delete_many({})
+    await repo.collection.delete_many({})
 
 
-@pytest.fixture
+@pytest_asyncio.fixture
 async def task_repository() -> AsyncGenerator[TaskRepository, None]:
     """Create task repository with test database."""
-    client = await get_mongo_client()
-    db = client.jarvis_test
-    repo = TaskRepository(db)
+    repo = TaskRepository()
     yield repo
     # Cleanup
-    await db.tasks.delete_many({})
+    await repo.collection.delete_many({})
 
 
-@pytest.fixture
+@pytest_asyncio.fixture
 async def vector_memory() -> VectorMemoryService:
     """Create vector memory service for testing."""
     return VectorMemoryService()
 
 
-@pytest.fixture
+@pytest_asyncio.fixture
 async def message_broker() -> MessageBroker:
     """Create message broker for testing."""
     return MessageBroker()
 
 
-@pytest.fixture
+@pytest_asyncio.fixture
 async def test_agent(
     test_agent_config: AgentConfig,
     agent_repository: AgentRepository,
@@ -98,7 +94,7 @@ async def test_agent(
     await agent_repository.delete(agent.agent_id)
 
 
-@pytest.fixture
+@pytest_asyncio.fixture
 async def agent_runner(
     test_agent: Agent,
     agent_repository: AgentRepository,
@@ -254,7 +250,7 @@ def assert_response_quality(
             )
 
 
-@pytest.fixture
+@pytest_asyncio.fixture
 async def cleanup_agent(agent_repository: AgentRepository, test_agent: Agent):
     """Cleanup fixture to ensure agent is deleted after test."""
     yield
