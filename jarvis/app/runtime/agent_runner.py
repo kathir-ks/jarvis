@@ -58,22 +58,27 @@ class AgentRunner:
         # State
         self.agent: Agent | None = None
         self.last_checkpoint_time: datetime | None = None
-        self.pending_messages: list[dict[str, Any]] = []
+
+        # Thread-safe message queue (replaces plain list)
+        self._message_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
+        # Track background tasks for proper lifecycle management
+        self._background_tasks: set[asyncio.Task] = set()
 
     async def run(self):
         """Main event loop for agent."""
         self.running = True
-        
+
         # Load agent state from DB
         self.agent = await self.agent_repo.get_by_id(self.agent_id)
         if not self.agent:
             logger.error(f"Agent {self.agent_id} not found in database")
             return
-        
+
         if not self.agent.is_active():
             logger.warning(f"Agent {self.agent_id} is not active (status: {self.agent.status})")
             return
-        
+
         logger.info(f"Agent {self.agent_id} starting event loop (type: {self.agent.agent_type})")
 
         # Initialize master orchestrator for MASTER agents
@@ -121,62 +126,102 @@ class AgentRunner:
         except Exception as e:
             logger.warning(f"Vector memory initialization failed (continuing without): {e}")
             self.vector_memory = None
-        
+
         # Update status to RUNNING
         await self.agent_repo.update_status(self.agent_id, AgentStatus.RUNNING)
-        
-        # Start message listener in background
-        asyncio.create_task(self._listen_for_messages())
-        
+
+        # Start message listener as a tracked background task
+        self._spawn_background_task(self._listen_for_messages())
+
         # Main loop
         loop_interval = self.agent.config.loop_interval_seconds
         checkpoint_interval = self.agent.config.checkpoint_interval_seconds
-        
-        while self.running:
-            try:
-                # 1. Process pending messages
-                await self._process_messages()
-                
-                # 2. Poll and execute pending tasks
-                await self._execute_pending_tasks()
-                
-                # 3. Checkpoint if needed
-                await self._checkpoint_if_needed(checkpoint_interval)
-                
-                # 4. Sleep before next iteration
-                await asyncio.sleep(loop_interval)
-                
-            except Exception as e:
-                logger.error(f"Error in agent {self.agent_id} loop: {e}", exc_info=True)
-                await self.agent_repo.update_status(self.agent_id, AgentStatus.ERROR)
-                await asyncio.sleep(5)  # Back off on error
+
+        try:
+            while self.running:
+                try:
+                    # 1. Process pending messages
+                    await self._process_messages()
+
+                    # 2. Poll and execute pending tasks
+                    await self._execute_pending_tasks()
+
+                    # 3. Checkpoint if needed
+                    await self._checkpoint_if_needed(checkpoint_interval)
+
+                    # 4. Sleep before next iteration
+                    await asyncio.sleep(loop_interval)
+
+                except Exception as e:
+                    logger.error(f"Error in agent {self.agent_id} loop: {e}", exc_info=True)
+                    await self.agent_repo.update_status(self.agent_id, AgentStatus.ERROR)
+                    await asyncio.sleep(5)  # Back off on error
+        finally:
+            # Cancel all background tasks on exit
+            await self._cancel_background_tasks()
+
+    def _spawn_background_task(self, coro) -> asyncio.Task:
+        """Create a tracked background task with automatic cleanup and restart."""
+        task = asyncio.create_task(coro)
+        self._background_tasks.add(task)
+
+        def _on_done(t: asyncio.Task):
+            self._background_tasks.discard(t)
+            if not t.cancelled() and t.exception():
+                logger.error(
+                    f"Background task for agent {self.agent_id} failed: {t.exception()}"
+                )
+                # Restart the message listener if it dies
+                if self.running:
+                    logger.info(f"Restarting message listener for agent {self.agent_id}")
+                    self._spawn_background_task(self._listen_for_messages())
+
+        task.add_done_callback(_on_done)
+        return task
+
+    async def _cancel_background_tasks(self):
+        """Cancel all tracked background tasks."""
+        for task in list(self._background_tasks):
+            task.cancel()
+        if self._background_tasks:
+            await asyncio.gather(*self._background_tasks, return_exceptions=True)
+        self._background_tasks.clear()
 
     async def _listen_for_messages(self):
         """Subscribe to agent inbox and queue messages."""
         channel = f"agent:{self.agent_id}:inbox"
-        
+
         async def message_handler(message_data: Any):
             logger.info(f"Agent {self.agent_id} received message: {message_data}")
-            self.pending_messages.append({"data": message_data, "received_at": datetime.utcnow()})
-        
+            await self._message_queue.put(
+                {"data": message_data, "received_at": datetime.utcnow()}
+            )
+
         try:
             await self.message_broker.subscribe(channel, message_handler)
+        except asyncio.CancelledError:
+            logger.debug(f"Message listener for agent {self.agent_id} cancelled")
+            raise
         except Exception as e:
             logger.error(f"Error in message listener for agent {self.agent_id}: {e}")
+            raise  # Let _spawn_background_task handle restart
 
     async def _process_messages(self):
-        """Process queued messages."""
-        if not self.pending_messages:
-            return
-        
-        messages_to_process = self.pending_messages[:]
-        self.pending_messages.clear()
-        
+        """Process queued messages from the async queue."""
+        # Drain all available messages without blocking
+        messages_to_process: list[dict[str, Any]] = []
+        while not self._message_queue.empty():
+            try:
+                msg = self._message_queue.get_nowait()
+                messages_to_process.append(msg)
+            except asyncio.QueueEmpty:
+                break
+
         for msg in messages_to_process:
             try:
                 await self._handle_message(msg)
             except Exception as e:
-                logger.error(f"Error processing message: {e}")
+                logger.error(f"Error processing message: {e}", exc_info=True)
 
     async def _handle_message(self, message: dict[str, Any]):
         """Handle individual message via LLM + tool orchestration."""
@@ -226,99 +271,13 @@ class AgentRunner:
         )
         llm_config = await self._build_llm_config()
 
-        # Tool calling loop - LLM may need multiple rounds to complete tool calls
-        max_iterations = 10
-        iteration = 0
-        assistant_text = ""
+        # Execute tool-calling loop (shared with delegation handler)
+        llm_response, assistant_text, iteration, tool_calls_made = (
+            await self._run_tool_calling_loop(llm_messages, llm_config)
+        )
 
-        while iteration < max_iterations:
-            iteration += 1
-
-            try:
-                llm_response = await self.llm_router.call(llm_messages, llm_config)
-            except Exception as exc:
-                logger.error("LLM call failed for agent %s (iteration %d): %s",
-                           self.agent_id, iteration, exc, exc_info=True)
-                await self._append_memory(
-                    role="assistant",
-                    content=f"Error while generating response: {exc}",
-                )
-                return
-
-            # Check if LLM wants to call tools
-            if llm_response.tool_calls:
-                logger.info("Agent %s LLM requested %d tool calls",
-                          self.agent_id, len(llm_response.tool_calls))
-
-                # Add assistant message with tool calls to history
-                llm_messages.append({
-                    "role": "assistant",
-                    "content": llm_response.content or "",
-                    "tool_calls": llm_response.tool_calls,
-                })
-
-                # Execute each tool call
-                for tool_call in llm_response.tool_calls:
-                    tool_name = tool_call["function"]["name"]
-                    tool_args_str = tool_call["function"]["arguments"]
-
-                    try:
-                        # Parse arguments (they come as JSON string)
-                        tool_args = json.loads(tool_args_str) if isinstance(tool_args_str, str) else tool_args_str
-                    except json.JSONDecodeError as e:
-                        logger.error("Failed to parse tool arguments: %s", e)
-                        tool_result_content = json.dumps({
-                            "error": f"Invalid JSON arguments: {str(e)}",
-                        })
-                    else:
-                        # Execute tool (via MCP if available, otherwise direct registry)
-                        logger.info("Executing tool: %s with args: %s", tool_name, tool_args)
-
-                        if self.mcp_client:
-                            # Execute via MCP protocol
-                            try:
-                                mcp_result = await self.mcp_client.call_tool(tool_name, tool_args)
-                                tool_result_content = json.dumps(mcp_result.get("result", {}))
-                                logger.info("Tool %s completed via MCP", tool_name)
-                            except Exception as mcp_error:
-                                tool_result_content = json.dumps({
-                                    "error": f"MCP tool execution failed: {str(mcp_error)}",
-                                })
-                                logger.warning("MCP tool %s failed: %s", tool_name, mcp_error)
-                        else:
-                            # Execute via direct tool registry
-                            tool_result = await self.tool_registry.execute(tool_name, tool_args)
-
-                            if tool_result.success:
-                                tool_result_content = json.dumps(tool_result.result)
-                                logger.info("Tool %s completed successfully in %.2fms",
-                                          tool_name, tool_result.execution_time_ms)
-                            else:
-                                tool_result_content = json.dumps({
-                                    "error": tool_result.error,
-                                })
-                                logger.warning("Tool %s failed: %s", tool_name, tool_result.error)
-
-                    # Add tool result to message history
-                    llm_messages.append({
-                        "role": "tool",
-                        "tool_call_id": tool_call["id"],
-                        "name": tool_name,
-                        "content": tool_result_content,
-                    })
-
-                # Continue loop to let LLM process tool results
-                continue
-
-            # No tool calls - we have the final response
-            assistant_text = llm_response.content
-            logger.info("Agent %s completed response after %d iterations", self.agent_id, iteration)
-            break
-
-        if iteration >= max_iterations:
-            logger.warning("Agent %s hit max tool calling iterations (%d)",
-                         self.agent_id, max_iterations)
-            assistant_text = llm_response.content or "I apologize, but I reached the maximum number of tool calls."
+        if llm_response is None:
+            return  # LLM call failed entirely; error already logged
 
         # Update short-term memory with user + assistant exchange
         await self._append_memory(
@@ -384,21 +343,152 @@ class AgentRunner:
                 },
             )
 
+    async def _run_tool_calling_loop(
+        self,
+        llm_messages: list[dict[str, Any]],
+        llm_config: dict[str, Any],
+        max_iterations: int = 10,
+    ) -> tuple[Any | None, str, int, list[dict[str, Any]]]:
+        """
+        Execute the LLM tool-calling loop until a final text response or iteration limit.
+
+        This is the single shared implementation used by both regular message handling
+        and sub-agent delegation handling.
+
+        Args:
+            llm_messages: Conversation messages to send to the LLM.
+            llm_config: LLM configuration dict (provider, model, tools, etc.).
+            max_iterations: Maximum rounds of tool calling before stopping.
+
+        Returns:
+            Tuple of (llm_response, assistant_text, iterations_used, tool_calls_made).
+            llm_response is None if the very first LLM call failed.
+        """
+        iteration = 0
+        assistant_text = ""
+        llm_response = None
+        tool_calls_made: list[dict[str, Any]] = []
+
+        while iteration < max_iterations:
+            iteration += 1
+
+            try:
+                llm_response = await self.llm_router.call(llm_messages, llm_config)
+            except Exception as exc:
+                logger.error(
+                    "LLM call failed for agent %s (iteration %d): %s",
+                    self.agent_id, iteration, exc, exc_info=True,
+                )
+                if iteration == 1:
+                    # First call failed — surface error to memory and bail out
+                    await self._append_memory(
+                        role="assistant",
+                        content=f"Error while generating response: {exc}",
+                    )
+                    return None, "", iteration, tool_calls_made
+                # Subsequent calls: return what we have so far
+                break
+
+            # Check if LLM wants to call tools
+            if llm_response.tool_calls:
+                logger.info(
+                    "Agent %s LLM requested %d tool calls",
+                    self.agent_id, len(llm_response.tool_calls),
+                )
+
+                # Add assistant message with tool calls to history
+                llm_messages.append({
+                    "role": "assistant",
+                    "content": llm_response.content or "",
+                    "tool_calls": llm_response.tool_calls,
+                })
+
+                # Execute each tool call
+                for tool_call in llm_response.tool_calls:
+                    tool_result_content = await self._execute_single_tool(tool_call)
+
+                    llm_messages.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call["id"],
+                        "name": tool_call["function"]["name"],
+                        "content": tool_result_content,
+                    })
+                    tool_calls_made.append({
+                        "name": tool_call["function"]["name"],
+                        "args": (
+                            json.loads(tool_call["function"]["arguments"])
+                            if isinstance(tool_call["function"]["arguments"], str)
+                            else tool_call["function"]["arguments"]
+                        ),
+                    })
+
+                # Continue loop to let LLM process tool results
+                continue
+
+            # No tool calls — we have the final response
+            assistant_text = llm_response.content or ""
+            logger.info("Agent %s completed response after %d iterations", self.agent_id, iteration)
+            break
+
+        if iteration >= max_iterations:
+            logger.warning(
+                "Agent %s hit max tool calling iterations (%d)",
+                self.agent_id, max_iterations,
+            )
+            assistant_text = (
+                (llm_response.content if llm_response else "")
+                or "I apologize, but I reached the maximum number of tool calls."
+            )
+
+        return llm_response, assistant_text, iteration, tool_calls_made
+
+    async def _execute_single_tool(self, tool_call: dict[str, Any]) -> str:
+        """
+        Execute a single tool call (via MCP or direct registry) and return result JSON.
+
+        Args:
+            tool_call: Tool call dict with 'id', 'function.name', 'function.arguments'.
+
+        Returns:
+            JSON string with tool result or error.
+        """
+        tool_name = tool_call["function"]["name"]
+        tool_args_str = tool_call["function"]["arguments"]
+
+        try:
+            tool_args = json.loads(tool_args_str) if isinstance(tool_args_str, str) else tool_args_str
+        except json.JSONDecodeError as e:
+            logger.error("Failed to parse tool arguments: %s", e)
+            return json.dumps({"error": f"Invalid JSON arguments: {str(e)}"})
+
+        logger.info("Executing tool: %s with args: %s", tool_name, tool_args)
+
+        if self.mcp_client:
+            try:
+                mcp_result = await self.mcp_client.call_tool(tool_name, tool_args)
+                logger.info("Tool %s completed via MCP", tool_name)
+                return json.dumps(mcp_result.get("result", {}))
+            except Exception as mcp_error:
+                logger.warning("MCP tool %s failed: %s", tool_name, mcp_error)
+                return json.dumps({"error": f"MCP tool execution failed: {str(mcp_error)}"})
+        else:
+            tool_result = await self.tool_registry.execute(tool_name, tool_args)
+            if tool_result.success:
+                logger.info(
+                    "Tool %s completed successfully in %.2fms",
+                    tool_name, tool_result.execution_time_ms,
+                )
+                return json.dumps(tool_result.result)
+            else:
+                logger.warning("Tool %s failed: %s", tool_name, tool_result.error)
+                return json.dumps({"error": tool_result.error})
+
     async def _handle_delegation_request(self, payload: dict[str, Any]) -> None:
         """
         Handle a delegation request from a master agent.
 
-        Executes the delegated subtask using LLM + tools and sends
+        Executes the delegated subtask using the shared tool-calling loop and sends
         the result back to the master agent via the reply channel.
-        Uses delegation context from the master for informed execution.
-
-        Args:
-            payload: Delegation request payload containing:
-                - delegation_id: Unique delegation identifier
-                - master_agent_id: ID of the delegating master agent
-                - task: Subtask definition (subtask_id, description, priority)
-                - reply_channel: Channel for result response
-                - context: DelegationContext with parent task info, memory, sibling results
         """
         if not self.agent:
             return
@@ -416,10 +506,9 @@ class AgentRunner:
 
         start_time = datetime.utcnow()
         subtask_description = task_info.get("description", "")
-        tool_calls_made = []
 
         try:
-            # Retrieve long-term context from vector memory for better subtask execution
+            # Retrieve long-term context from vector memory
             long_term_context = None
             if self.vector_memory:
                 try:
@@ -438,7 +527,7 @@ class AgentRunner:
                 except Exception as e:
                     logger.warning(f"Failed to retrieve long-term context for delegation: {e}")
 
-            # Build prompt using delegation context (includes parent task, sibling results)
+            # Build prompt using delegation context
             if delegation_context:
                 llm_messages = self.prompt_builder.build_delegation_messages(
                     agent=self.agent,
@@ -446,7 +535,6 @@ class AgentRunner:
                     long_term_context=long_term_context,
                 )
             else:
-                # Fallback: use standard prompt building if no delegation context
                 llm_messages = self.prompt_builder.build_agent_messages(
                     self.agent,
                     {"content": subtask_description, "type": "delegation"},
@@ -455,66 +543,13 @@ class AgentRunner:
 
             llm_config = await self._build_llm_config()
 
-            # Execute with tool calling loop
-            max_iterations = 10
-            iteration = 0
-            final_response = ""
-
-            while iteration < max_iterations:
-                iteration += 1
-
-                llm_response = await self.llm_router.call(llm_messages, llm_config)
-
-                if llm_response.tool_calls:
-                    llm_messages.append({
-                        "role": "assistant",
-                        "content": llm_response.content or "",
-                        "tool_calls": llm_response.tool_calls,
-                    })
-
-                    # Execute tools
-                    for tool_call in llm_response.tool_calls:
-                        tool_name = tool_call["function"]["name"]
-                        tool_args_str = tool_call["function"]["arguments"]
-
-                        try:
-                            tool_args = json.loads(tool_args_str) if isinstance(tool_args_str, str) else tool_args_str
-                        except json.JSONDecodeError as e:
-                            tool_result_content = json.dumps({"error": f"Invalid JSON: {e}"})
-                        else:
-                            if self.mcp_client:
-                                try:
-                                    mcp_result = await self.mcp_client.call_tool(tool_name, tool_args)
-                                    tool_result_content = json.dumps(mcp_result.get("result", {}))
-                                except Exception as mcp_error:
-                                    tool_result_content = json.dumps({"error": str(mcp_error)})
-                            else:
-                                tool_result = await self.tool_registry.execute(tool_name, tool_args)
-                                if tool_result.success:
-                                    tool_result_content = json.dumps(tool_result.result)
-                                else:
-                                    tool_result_content = json.dumps({"error": tool_result.error})
-
-                        llm_messages.append({
-                            "role": "tool",
-                            "tool_call_id": tool_call["id"],
-                            "name": tool_name,
-                            "content": tool_result_content,
-                        })
-                        tool_calls_made.append({
-                            "name": tool_name,
-                            "args": tool_args if isinstance(tool_args, dict) else {},
-                        })
-
-                    continue
-
-                # No more tool calls - we have the final response
-                final_response = llm_response.content or ""
-                break
+            # Execute with shared tool-calling loop
+            _llm_response, final_response, _iteration, tool_calls_made = (
+                await self._run_tool_calling_loop(llm_messages, llm_config)
+            )
 
             execution_time_ms = (datetime.utcnow() - start_time).total_seconds() * 1000
 
-            # Send result back to master agent
             result_message = {
                 "type": "delegation_result",
                 "delegation_id": delegation_id,
@@ -547,7 +582,7 @@ class AgentRunner:
                 "result": {
                     "subtask_id": task_info.get("subtask_id"),
                     "output": "",
-                    "tool_calls": tool_calls_made,
+                    "tool_calls": [],
                     "execution_time_ms": execution_time_ms,
                 },
                 "error": str(e),
@@ -564,15 +599,15 @@ class AgentRunner:
         """Fetch and execute pending tasks using DAG executor."""
         # Get pending tasks for this agent
         tasks = await self.task_repo.get_pending_tasks(self.agent_id, limit=25)
-        
+
         if not tasks:
             return
-        
+
         logger.info(f"Agent {self.agent_id} found {len(tasks)} pending tasks")
-        
+
         # Execute with DAG respecting dependencies
         dag_executor = DAGExecutor(tasks, max_concurrent=5)
-        
+
         async def task_executor(task: Task) -> dict[str, Any]:
             """Execute single task."""
             # Check for cancellation
@@ -583,10 +618,10 @@ class AgentRunner:
                     error="Cancelled by user"
                 )
                 return {"status": "CANCELLED"}
-            
+
             # Submit to Celery for execution
             await self.task_repo.update_status(task.task_id, TaskStatus.RUNNING)
-            
+
             try:
                 result = await submit_task_to_celery(task)
                 await self.task_repo.update_status(
@@ -598,7 +633,7 @@ class AgentRunner:
             except Exception as e:
                 logger.error(f"Task {task.task_id} execution failed: {e}")
                 await self.task_repo.increment_retry(task.task_id)
-                
+
                 # Check if retries exhausted
                 task_updated = await self.task_repo.get_by_id(task.task_id)
                 if task_updated and task_updated.retry_count >= task_updated.max_retries:
@@ -610,9 +645,9 @@ class AgentRunner:
                 else:
                     # Reset to PENDING for retry
                     await self.task_repo.update_status(task.task_id, TaskStatus.PENDING)
-                
+
                 raise
-        
+
         # Execute DAG
         try:
             results = await dag_executor.execute(task_executor)
@@ -623,12 +658,12 @@ class AgentRunner:
     async def _checkpoint_if_needed(self, interval_seconds: int):
         """Checkpoint agent state if interval elapsed."""
         now = datetime.utcnow()
-        
+
         if self.last_checkpoint_time is None:
             should_checkpoint = True
         else:
             should_checkpoint = (now - self.last_checkpoint_time).total_seconds() >= interval_seconds
-        
+
         if should_checkpoint and self.agent:
             await self._checkpoint()
 
@@ -636,21 +671,21 @@ class AgentRunner:
         """Save agent state to database."""
         if not self.agent:
             return
-        
+
         # Update task queue metadata
         pending_tasks = await self.task_repo.get_pending_tasks(self.agent_id, limit=100)
         self.agent.task_queue_meta = {
             "pending_count": len(pending_tasks),
             "active_tasks": [t.task_id for t in pending_tasks[:10]]
         }
-        
+
         # Persist checkpoint
         await self.agent_repo.checkpoint(
             self.agent_id,
             self.agent.context,
             self.agent.task_queue_meta
         )
-        
+
         self.last_checkpoint_time = datetime.utcnow()
         logger.debug(f"Checkpointed agent {self.agent_id}")
 
@@ -658,10 +693,13 @@ class AgentRunner:
         """Stop the agent loop gracefully."""
         self.running = False
         logger.info(f"Agent {self.agent_id} stopping")
-    
+
     async def terminate(self):
         """Terminate agent and cleanup."""
         self.stop()
+
+        # Cancel in-flight background tasks
+        await self._cancel_background_tasks()
 
         if self.agent:
             await self._checkpoint()

@@ -6,6 +6,7 @@ from datetime import datetime
 from typing import Any
 
 from ..runtime.agent import Agent
+from ..runtime.workspace_bootstrap import get_workspace_bootstrap
 from .token_counter import get_token_counter
 from ..runtime.memory_selector import get_memory_selector
 
@@ -25,6 +26,7 @@ class PromptBuilder:
         """Initialize prompt builder with token counter and memory selector."""
         self.token_counter = get_token_counter()
         self.memory_selector = get_memory_selector()
+        self.workspace_bootstrap = get_workspace_bootstrap()
 
     def build_agent_messages(
         self,
@@ -44,8 +46,13 @@ class PromptBuilder:
         Returns:
             List of chat messages for LLM
         """
+        # Build system prompt with workspace bootstrap (agent identity + persona)
+        system_prompt = self.workspace_bootstrap.build_system_prompt(
+            agent_id=agent.agent_id,
+            base_prompt=self.BASE_SYSTEM_PROMPT,
+        )
         system_messages = [
-            {"role": "system", "content": self.BASE_SYSTEM_PROMPT},
+            {"role": "system", "content": system_prompt},
         ]
 
         # Add short-term memory (recent interactions)
