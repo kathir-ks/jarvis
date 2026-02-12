@@ -568,9 +568,12 @@ get_recent_context()   # Retrieve multi-source context
 ### 1. Agent Capabilities Registry (`agent_capabilities.py`)
 - ✅ `AgentCapability` model with tools, tags, complexity level
 - ✅ 6 standard capabilities (web_research, code_execution, etc.)
-- ✅ `register_capability()` / `unregister_capability()`
+- ✅ `register_capability()` / `unregister_capability()` (sync)
+- ✅ `register_capability_async()` / `unregister_capability_async()` (with persistence)
 - ✅ `find_capable_agents()` for capability-based discovery
-- ✅ `auto_register_from_tools()` for automatic registration
+- ✅ `auto_register_from_tools()` / `auto_register_from_tools_async()`
+- ✅ **MongoDB persistence** via `CapabilityRepository` (write-through cache)
+- ✅ `load_from_db()` for startup restoration
 
 ### 2. Task Complexity Analyzer (`task_analyzer.py`)
 - ✅ Multi-factor complexity scoring (0-10 scale)
@@ -582,23 +585,43 @@ get_recent_context()   # Retrieve multi-source context
 ### 3. Master Agent Orchestrator (`master_agent.py`)
 - ✅ `handle_task()` with intelligent routing
 - ✅ `spawn_sub_agent()` with capability-based configuration
-- ✅ `delegate_to_sub_agent()` via Redis Pub/Sub
+- ✅ `delegate_to_sub_agent()` via Redis Pub/Sub **with rich context propagation**
 - ✅ `aggregate_results()` with LLM synthesis
-- ✅ `orchestrate_delegation()` complete workflow
+- ✅ `orchestrate_delegation()` complete workflow **with sequential context chaining**
 - ✅ `cleanup_sub_agents()` lifecycle management
+- ✅ **Delegation result storage** in long-term vector memory
 
-### 4. Inter-Agent Message Protocol
-- ✅ `delegation_request` message type
+### 4. Delegation Context Management (`delegation_context.py`) — **NEW**
+- ✅ `DelegationContext` model (parent task, memory summary, session state, sibling results)
+- ✅ `DelegationContextManager` for context packaging and propagation
+- ✅ Master short-term memory summarization for sub-agents
+- ✅ Session context extraction (filtered, no internal keys)
+- ✅ Sequential subtask result chaining (prior results → next sub-agent)
+- ✅ Delegation result storage in vector memory (knowledge entries)
+
+### 5. Inter-Agent Message Protocol
+- ✅ `delegation_request` message type **with DelegationContext payload**
 - ✅ `delegation_result` message type
 - ✅ Reply channel pattern for result collection
 - ✅ Timeout handling (10 minutes default)
 
-### 5. Agent Runner Integration
-- ✅ Master orchestrator initialization for MASTER agents
-- ✅ `_handle_delegation_request()` for SUB_AGENT
+### 6. Agent Runner Integration
+- ✅ Master orchestrator initialization with agent entity + vector memory
+- ✅ `_handle_delegation_request()` with **delegation context** and **long-term memory retrieval**
 - ✅ Result reporting to master via reply channel
+- ✅ Fallback to standard prompt building when no delegation context available
 
-**Quality**: 9/10
+### 7. Delegation-Aware Prompt Building (`prompt_builder.py`)
+- ✅ `build_delegation_messages()` — Sub-agent-specific prompts with:
+  - Sub-agent role-aware system prompt
+  - Parent task context (overall goal)
+  - Master's conversation history summary
+  - Sibling subtask results (for sequential workflows)
+  - Session context from master
+  - Long-term memory from vector store
+- ✅ `_format_sibling_results()` for prior subtask output formatting
+
+**Quality**: 9.5/10
 
 **Delegation Workflow**:
 ```python
@@ -606,10 +629,16 @@ get_recent_context()   # Retrieve multi-source context
 2. If complex (score >= 5):
    a. Create delegation plan with subtasks
    b. Spawn/find sub-agents for each capability
-   c. Delegate subtasks via Redis messages
-   d. Collect results with timeout
-   e. Aggregate with LLM synthesis
-   f. Cleanup sub-agents
+   c. Build DelegationContext (parent memory, session state, prior results)
+   d. Delegate subtasks via Redis messages with context
+      - Sequential: collect results between delegations, pass to next
+      - Parallel: delegate all at once
+   e. Sub-agents receive context + retrieve long-term memory
+   f. Sub-agents execute with delegation-aware prompts
+   g. Collect results with timeout
+   h. Aggregate with LLM synthesis
+   i. Store delegation results in vector memory
+   j. Cleanup sub-agents
 3. If simple: Execute directly
 ```
 
@@ -727,6 +756,6 @@ With Phase 4 complete, Jarvis is now a fully-functional multi-agent orchestratio
 
 ---
 
-**Last Updated**: February 4, 2026
+**Last Updated**: February 12, 2026
 **Assessed By**: System Architecture Analysis
 **Next Review**: After security hardening

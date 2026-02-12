@@ -83,6 +83,8 @@ class AgentRunner:
                 agent_service=self._agent_service,
                 llm_router=self.llm_router,
                 user_id=self.agent.user_id,
+                master_agent=self.agent,
+                vector_memory=self.vector_memory,
             )
             logger.info(f"Master orchestrator initialized for agent {self.agent_id}")
 
@@ -112,6 +114,10 @@ class AgentRunner:
             self.vector_memory = get_vector_memory_service()
             await self.vector_memory.initialize_collections()
             logger.info(f"Agent {self.agent_id} vector memory initialized")
+
+            # Update master orchestrator with vector memory reference
+            if self.master_orchestrator:
+                self.master_orchestrator._vector_memory = self.vector_memory
         except Exception as e:
             logger.warning(f"Vector memory initialization failed (continuing without): {e}")
             self.vector_memory = None
@@ -384,6 +390,7 @@ class AgentRunner:
 
         Executes the delegated subtask using LLM + tools and sends
         the result back to the master agent via the reply channel.
+        Uses delegation context from the master for informed execution.
 
         Args:
             payload: Delegation request payload containing:
@@ -391,6 +398,7 @@ class AgentRunner:
                 - master_agent_id: ID of the delegating master agent
                 - task: Subtask definition (subtask_id, description, priority)
                 - reply_channel: Channel for result response
+                - context: DelegationContext with parent task info, memory, sibling results
         """
         if not self.agent:
             return
@@ -399,6 +407,7 @@ class AgentRunner:
         master_agent_id = payload.get("master_agent_id")
         task_info = payload.get("task", {})
         reply_channel = payload.get("reply_channel")
+        delegation_context = payload.get("context", {})
 
         logger.info(
             f"Sub-agent {self.agent_id} handling delegation {delegation_id} "
@@ -410,11 +419,40 @@ class AgentRunner:
         tool_calls_made = []
 
         try:
-            # Build prompt for the subtask
-            llm_messages = self.prompt_builder.build_agent_messages(
-                self.agent,
-                {"content": subtask_description, "type": "delegation"},
-            )
+            # Retrieve long-term context from vector memory for better subtask execution
+            long_term_context = None
+            if self.vector_memory:
+                try:
+                    long_term_context = await self.vector_memory.get_recent_context(
+                        user_id=self.agent.user_id,
+                        agent_id=self.agent_id,
+                        query=subtask_description,
+                        interaction_limit=3,
+                        discovery_limit=2,
+                        knowledge_limit=2,
+                    )
+                    logger.debug(
+                        f"Delegation {delegation_id}: retrieved long-term context "
+                        f"({len(long_term_context.get('interactions', []))} interactions)"
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to retrieve long-term context for delegation: {e}")
+
+            # Build prompt using delegation context (includes parent task, sibling results)
+            if delegation_context:
+                llm_messages = self.prompt_builder.build_delegation_messages(
+                    agent=self.agent,
+                    delegation_context=delegation_context,
+                    long_term_context=long_term_context,
+                )
+            else:
+                # Fallback: use standard prompt building if no delegation context
+                llm_messages = self.prompt_builder.build_agent_messages(
+                    self.agent,
+                    {"content": subtask_description, "type": "delegation"},
+                    long_term_context=long_term_context,
+                )
+
             llm_config = await self._build_llm_config()
 
             # Execute with tool calling loop
