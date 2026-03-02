@@ -9,6 +9,18 @@ Phase 4 Implementation:
 - Delegation via Redis Pub/Sub messaging
 - Result aggregation with LLM synthesis
 - Complete orchestration workflow for complex tasks
+
+Context Management (Phase 4.5):
+- Rich context propagation from master to sub-agents
+- Sequential subtask context chaining (prior results flow to next subtask)
+- Delegation result storage in long-term memory
+
+Agent Communication (Phase 4.6):
+- Circuit breaker protection for failing agents
+- Agent directory with health-aware, load-balanced selection
+- Configurable LLM provider for sub-agents
+- Timeout enforcement with exponential backoff retry
+- Peer-to-peer messaging via AgentCommunicationHub
 """
 import asyncio
 import json
@@ -20,12 +32,23 @@ from typing import Any
 from .task import Task
 from .task_analyzer import get_task_analyzer
 from .agent_capabilities import get_capabilities_registry, STANDARD_CAPABILITIES
+from .agent_directory import AgentDirectory, get_agent_directory
+from .circuit_breaker import CircuitBreaker, CircuitOpenError, retry_with_backoff, with_timeout
+from .delegation_context import DelegationContextManager
 from ..messaging.broker import MessageBroker
 
 logger = logging.getLogger(__name__)
 
 # Default timeout for sub-agent delegation (10 minutes)
 DEFAULT_DELEGATION_TIMEOUT_SECONDS = 600
+
+# Default LLM configuration for sub-agents (configurable via set_sub_agent_llm_config)
+DEFAULT_SUB_AGENT_LLM_CONFIG: dict[str, Any] = {
+    "llm_provider": "gemini",
+    "model": "gemini-2.0-flash-exp",
+    "temperature": 0.7,
+    "max_tokens": 4096,
+}
 
 
 class MasterAgentOrchestrator:
@@ -37,6 +60,13 @@ class MasterAgentOrchestrator:
     - Delegates subtasks via Redis Pub/Sub messaging
     - Aggregates results from sub-agents using LLM synthesis
     - Coordinates multi-agent workflows with timeout handling
+
+    Phase 4.6 Enhancements:
+    - Circuit breaker prevents delegation to consistently failing agents
+    - Agent directory provides health-aware, load-balanced selection
+    - Sub-agent LLM provider is configurable (no longer hardcoded)
+    - Delegation retries with exponential backoff
+    - Proper timeout enforcement via asyncio.wait_for
     """
 
     def __init__(
@@ -45,6 +75,8 @@ class MasterAgentOrchestrator:
         agent_service: Any = None,
         llm_router: Any = None,
         user_id: str | None = None,
+        master_agent: Any = None,
+        vector_memory: Any = None,
     ):
         """
         Initialize master agent orchestrator.
@@ -54,16 +86,26 @@ class MasterAgentOrchestrator:
             agent_service: AgentService for spawning sub-agents (injected)
             llm_router: LLMRouter for result synthesis (injected)
             user_id: User ID for sub-agent creation
+            master_agent: The master Agent entity (for context access)
+            vector_memory: VectorMemoryService for storing delegation results
         """
         self.agent_id = agent_id
         self.task_analyzer = get_task_analyzer()
         self.capabilities_registry = get_capabilities_registry()
+        self.agent_directory = get_agent_directory()
+        self.circuit_breaker = CircuitBreaker(
+            failure_threshold=3,
+            recovery_timeout_seconds=60.0,
+        )
         self.message_broker = MessageBroker()
+        self.context_manager = DelegationContextManager()
 
         # Injected dependencies (set via set_dependencies)
         self._agent_service = agent_service
         self._llm_router = llm_router
         self._user_id = user_id
+        self._agent = master_agent
+        self._vector_memory = vector_memory
 
         # Track spawned sub-agents for cleanup
         self._spawned_sub_agents: list[str] = []
@@ -71,11 +113,19 @@ class MasterAgentOrchestrator:
         # Track pending delegations
         self._pending_delegations: dict[str, dict[str, Any]] = {}
 
+        # Configurable LLM for sub-agents (defaults to Gemini flash)
+        self._sub_agent_llm_config: dict[str, Any] = dict(DEFAULT_SUB_AGENT_LLM_CONFIG)
+
+        # Configurable LLM for synthesis calls
+        self._synthesis_llm_config: dict[str, Any] | None = None
+
     def set_dependencies(
         self,
         agent_service: Any,
         llm_router: Any,
         user_id: str,
+        master_agent: Any = None,
+        vector_memory: Any = None,
     ) -> None:
         """
         Set dependencies after initialization.
@@ -84,10 +134,38 @@ class MasterAgentOrchestrator:
             agent_service: AgentService for spawning
             llm_router: LLMRouter for synthesis
             user_id: User ID
+            master_agent: The master Agent entity (for context access)
+            vector_memory: VectorMemoryService for result storage
         """
         self._agent_service = agent_service
         self._llm_router = llm_router
         self._user_id = user_id
+        if master_agent is not None:
+            self._agent = master_agent
+        if vector_memory is not None:
+            self._vector_memory = vector_memory
+
+    def set_sub_agent_llm_config(self, config: dict[str, Any]) -> None:
+        """
+        Configure the LLM provider/model used when spawning sub-agents.
+
+        Args:
+            config: Dict with keys: llm_provider, model, temperature, max_tokens.
+        """
+        self._sub_agent_llm_config.update(config)
+        logger.info("Sub-agent LLM config updated: %s", self._sub_agent_llm_config)
+
+    def set_synthesis_llm_config(self, config: dict[str, Any]) -> None:
+        """
+        Configure the LLM provider/model used for result synthesis.
+
+        If not set, falls back to sub-agent LLM config.
+
+        Args:
+            config: Dict with keys: provider, model, temperature, max_tokens.
+        """
+        self._synthesis_llm_config = config
+        logger.info("Synthesis LLM config updated: %s", config)
 
     async def handle_task(self, task: Task) -> dict[str, Any]:
         """
@@ -187,21 +265,37 @@ class MasterAgentOrchestrator:
             "parallel_execution": self._can_parallelize(analysis),
         }
 
-        # Find capable agents or mark for spawning
+        # Find capable agents using agent directory (health + load aware)
+        # Falls back to capabilities registry if directory has no matches
         agent_assignments = {}
         for capability_id in analysis["suggested_sub_agents"]:
-            capable_agents = self.capabilities_registry.find_capable_agents(
-                required_capability=capability_id
+            # Try agent directory first (health-aware, load-balanced)
+            best_agent = self.agent_directory.find_agent(
+                capability=capability_id,
+                prefer_healthy=True,
+                prefer_least_loaded=True,
             )
 
-            if capable_agents:
+            if not best_agent:
+                # Fallback to capabilities registry
+                capable_agents = self.capabilities_registry.find_capable_agents(
+                    required_capability=capability_id
+                )
+                # Filter out agents with open circuits
+                capable_agents = [
+                    a for a in capable_agents
+                    if self.circuit_breaker.can_call(a)
+                ]
+                best_agent = capable_agents[0] if capable_agents else None
+
+            if best_agent:
                 agent_assignments[capability_id] = {
-                    "agent_id": capable_agents[0],
+                    "agent_id": best_agent,
                     "action": "reuse",
                 }
                 logger.debug(
-                    f"Capability '{capability_id}' assigned to existing agent "
-                    f"{capable_agents[0]}"
+                    f"Capability '{capability_id}' assigned to agent "
+                    f"{best_agent} (health-aware selection)"
                 )
             else:
                 agent_assignments[capability_id] = {
@@ -209,7 +303,7 @@ class MasterAgentOrchestrator:
                     "action": "spawn",
                 }
                 logger.info(
-                    f"No agents with capability '{capability_id}'. "
+                    f"No healthy agents with capability '{capability_id}'. "
                     "Will spawn new sub-agent."
                 )
 
@@ -334,8 +428,10 @@ class MasterAgentOrchestrator:
         Spawn a new sub-agent with specific capability.
 
         Creates a sub-agent configured with the tools required for
-        the specified capability, registers the capability, and
-        starts the agent runtime.
+        the specified capability, registers the capability, starts
+        the agent runtime, and registers it in the agent directory.
+
+        Uses configurable LLM provider (set via set_sub_agent_llm_config).
 
         Args:
             capability_id: Required capability ID
@@ -369,15 +465,10 @@ class MasterAgentOrchestrator:
         )
 
         try:
-            # Spawn via agent service
+            # Spawn via agent service using configurable LLM config
             sub_agent_response = await self._agent_service.spawn_sub_agent(
                 parent_agent_id=self.agent_id,
-                config={
-                    "llm_provider": "gemini",  # Use Gemini for sub-agents (fast)
-                    "model": "gemini-2.0-flash-exp",
-                    "temperature": 0.7,
-                    "max_tokens": 4096,
-                },
+                config=dict(self._sub_agent_llm_config),
                 tools_enabled=required_tools,
             )
 
@@ -390,6 +481,18 @@ class MasterAgentOrchestrator:
             # Start the sub-agent runtime
             await self._agent_service.start_agent_runtime(sub_agent_id)
             logger.info(f"Started runtime for sub-agent {sub_agent_id}")
+
+            # Register in agent directory for health-aware discovery
+            self.agent_directory.register(
+                agent_id=sub_agent_id,
+                agent_type="sub_agent",
+                capabilities=[capability_id],
+                metadata={
+                    "parent_agent_id": self.agent_id,
+                    "llm_provider": self._sub_agent_llm_config.get("llm_provider"),
+                    "model": self._sub_agent_llm_config.get("model"),
+                },
+            )
 
             # Track spawned agent for cleanup
             self._spawned_sub_agents.append(sub_agent_id)
@@ -404,12 +507,17 @@ class MasterAgentOrchestrator:
         self,
         sub_agent_id: str,
         subtask: dict[str, Any],
+        parent_task_description: str = "",
+        subtask_index: int = 0,
+        total_subtasks: int = 1,
+        prior_results: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         """
         Delegate a subtask to a sub-agent via messaging.
 
         Sends a delegation request message to the sub-agent's inbox
-        and sets up a reply channel for result collection.
+        and sets up a reply channel for result collection. Includes
+        rich context from the master agent for informed execution.
 
         Args:
             sub_agent_id: ID of sub-agent to delegate to
@@ -418,6 +526,10 @@ class MasterAgentOrchestrator:
                 - description: Task description
                 - priority: Task priority (1-10)
                 - timeout_seconds: Maximum execution time
+            parent_task_description: The original user task (for context)
+            subtask_index: Position of this subtask in the sequence
+            total_subtasks: Total number of subtasks in this delegation
+            prior_results: Results from previously completed subtasks
 
         Returns:
             Delegation info dict containing:
@@ -428,6 +540,31 @@ class MasterAgentOrchestrator:
         """
         delegation_id = f"del_{uuid.uuid4().hex[:12]}"
         reply_channel = f"agent:{self.agent_id}:delegations:{delegation_id}"
+
+        # Build rich delegation context from master's state
+        delegation_context = {}
+        if self._agent:
+            delegation_context = self.context_manager.build_context_for_sub_agent(
+                master_agent=self._agent,
+                parent_task_description=parent_task_description,
+                subtask=subtask,
+                subtask_index=subtask_index,
+                total_subtasks=total_subtasks,
+                prior_results=prior_results,
+            ).model_dump()
+        else:
+            # Minimal context when master agent entity is not available
+            delegation_context = {
+                "parent_task_description": parent_task_description,
+                "subtask_description": subtask.get("description", ""),
+                "subtask_index": subtask_index,
+                "total_subtasks": total_subtasks,
+                "sibling_results": [],
+                "parent_short_term_summary": "",
+                "parent_session_context": {},
+                "master_agent_id": self.agent_id,
+                "delegation_chain_depth": 1,
+            }
 
         # Build delegation request message
         delegation_message = {
@@ -442,7 +579,7 @@ class MasterAgentOrchestrator:
                 "required_capability": subtask.get("assigned_capability"),
             },
             "reply_channel": reply_channel,
-            "context": {},  # Could pass additional context here
+            "context": delegation_context,
             "timestamp": datetime.utcnow().isoformat(),
         }
 
@@ -450,9 +587,27 @@ class MasterAgentOrchestrator:
             f"Delegating subtask '{subtask.get('subtask_id')}' to sub-agent {sub_agent_id}"
         )
 
+        # Check circuit breaker before delegating
+        if not self.circuit_breaker.can_call(sub_agent_id):
+            logger.warning(
+                f"Circuit open for agent {sub_agent_id} — skipping delegation "
+                f"{delegation_id}"
+            )
+            return {
+                "delegation_id": delegation_id,
+                "sub_agent_id": sub_agent_id,
+                "subtask": subtask,
+                "reply_channel": reply_channel,
+                "status": "circuit_open",
+                "delegated_at": datetime.utcnow().isoformat(),
+            }
+
         # Publish to sub-agent's inbox
         inbox_channel = f"agent:{sub_agent_id}:inbox"
         await self.message_broker.publish(inbox_channel, delegation_message)
+
+        # Track active work in the directory
+        self.agent_directory.increment_active_tasks(sub_agent_id)
 
         # Track pending delegation
         delegation_info = {
@@ -600,15 +755,18 @@ Integrate the findings naturally without explicitly mentioning "subtasks" or "su
             {"role": "user", "content": synthesis_prompt},
         ]
 
+        # Build synthesis config from dedicated config or sub-agent config
+        synthesis_config = self._synthesis_llm_config or {
+            "provider": self._sub_agent_llm_config.get("llm_provider", "gemini"),
+            "model": self._sub_agent_llm_config.get("model", "gemini-2.0-flash-exp"),
+            "temperature": 0.7,
+            "max_tokens": 2048,
+        }
+
         try:
             llm_response = await self._llm_router.call(
                 messages=messages,
-                config={
-                    "provider": "gemini",
-                    "model": "gemini-2.0-flash-exp",
-                    "temperature": 0.7,
-                    "max_tokens": 2048,
-                },
+                config=synthesis_config,
             )
             return llm_response.content or ""
         except Exception as e:
@@ -670,35 +828,96 @@ Integrate the findings naturally without explicitly mentioning "subtasks" or "su
                     continue
 
         # Step 2: Delegate subtasks to sub-agents
-        for subtask in subtasks:
-            capability_id = subtask.get("assigned_capability")
-            assignment = agent_assignments.get(capability_id, {})
-            sub_agent_id = assignment.get("agent_id")
+        # For sequential workflows, collect results as we go so prior results
+        # can be passed to subsequent subtasks as context
+        is_parallel = execution_plan.get("parallel_execution", True)
+        collected_results: list[dict[str, Any]] = []
 
-            if not sub_agent_id:
-                logger.warning(
-                    f"No agent available for subtask '{subtask.get('subtask_id')}'"
+        if is_parallel:
+            # Parallel: delegate all at once
+            for i, subtask in enumerate(subtasks):
+                capability_id = subtask.get("assigned_capability")
+                assignment = agent_assignments.get(capability_id, {})
+                sub_agent_id = assignment.get("agent_id")
+
+                if not sub_agent_id:
+                    logger.warning(
+                        f"No agent available for subtask '{subtask.get('subtask_id')}'"
+                    )
+                    continue
+
+                delegation_info = await self.delegate_to_sub_agent(
+                    sub_agent_id=sub_agent_id,
+                    subtask=subtask,
+                    parent_task_description=task.task_description,
+                    subtask_index=i,
+                    total_subtasks=len(subtasks),
+                    prior_results=None,  # No prior results in parallel mode
                 )
-                continue
+                delegations.append(delegation_info)
 
-            delegation_info = await self.delegate_to_sub_agent(sub_agent_id, subtask)
-            delegations.append(delegation_info)
+            if not delegations:
+                logger.error("No delegations were created - falling back to direct execution")
+                return await self._execute_task_directly(task)
 
-        if not delegations:
-            logger.error("No delegations were created - falling back to direct execution")
-            return await self._execute_task_directly(task)
+            # Collect all results at once
+            logger.info(f"Collecting results from {len(delegations)} parallel delegations")
+            collected_results = await self._collect_delegation_results(
+                delegations=delegations,
+                timeout_seconds=DEFAULT_DELEGATION_TIMEOUT_SECONDS,
+            )
+        else:
+            # Sequential: delegate one at a time, passing prior results as context
+            for i, subtask in enumerate(subtasks):
+                capability_id = subtask.get("assigned_capability")
+                assignment = agent_assignments.get(capability_id, {})
+                sub_agent_id = assignment.get("agent_id")
 
-        # Step 3: Collect results with timeout
-        logger.info(f"Collecting results from {len(delegations)} delegations")
-        results = await self._collect_delegation_results(
-            delegations=delegations,
-            timeout_seconds=DEFAULT_DELEGATION_TIMEOUT_SECONDS,
+                if not sub_agent_id:
+                    logger.warning(
+                        f"No agent available for subtask '{subtask.get('subtask_id')}'"
+                    )
+                    continue
+
+                logger.info(
+                    f"Sequential delegation {i + 1}/{len(subtasks)}: "
+                    f"{subtask.get('subtask_id')} → {sub_agent_id}"
+                )
+
+                delegation_info = await self.delegate_to_sub_agent(
+                    sub_agent_id=sub_agent_id,
+                    subtask=subtask,
+                    parent_task_description=task.task_description,
+                    subtask_index=i,
+                    total_subtasks=len(subtasks),
+                    prior_results=collected_results,  # Pass all prior results
+                )
+                delegations.append(delegation_info)
+
+                # Collect this single result before moving to next
+                step_results = await self._collect_delegation_results(
+                    delegations=[delegation_info],
+                    timeout_seconds=DEFAULT_DELEGATION_TIMEOUT_SECONDS,
+                )
+                collected_results.extend(step_results)
+
+            if not delegations:
+                logger.error("No delegations were created - falling back to direct execution")
+                return await self._execute_task_directly(task)
+
+        # Step 3: Aggregate results
+        aggregated = await self.aggregate_results(
+            subtask_results=collected_results,
+            original_task_description=task.task_description,
         )
 
-        # Step 4: Aggregate results
-        aggregated = await self.aggregate_results(
-            subtask_results=results,
-            original_task_description=task.task_description,
+        # Step 4: Store delegation results in long-term memory
+        await self.context_manager.store_delegation_result(
+            vector_memory=self._vector_memory,
+            agent_id=self.agent_id,
+            user_id=self._user_id or "",
+            task_description=task.task_description,
+            aggregated_result=aggregated,
         )
 
         # Step 5: Cleanup spawned sub-agents
@@ -787,17 +1006,33 @@ Integrate the findings naturally without explicitly mentioning "subtasks" or "su
         for listener in listeners:
             listener.cancel()
 
-        # Build results list
+        # Build results list and record outcomes
         for delegation_id, delegation in pending.items():
+            sub_agent_id = delegation.get("sub_agent_id", "")
+
             if delegation_id in collected:
                 result_data = collected[delegation_id]
+                status = result_data.get("status", "completed")
                 results.append({
                     "delegation_id": delegation_id,
-                    "status": result_data.get("status", "completed"),
+                    "status": status,
                     "result": result_data.get("result", {}),
                     "subtask": delegation.get("subtask", {}),
                     "error": result_data.get("error"),
                 })
+
+                # Record outcome in circuit breaker and directory
+                if status == "completed":
+                    exec_time = result_data.get("result", {}).get("execution_time_ms", 0)
+                    self.circuit_breaker.record_success(sub_agent_id)
+                    self.agent_directory.record_task_outcome(
+                        sub_agent_id, success=True, response_time_ms=exec_time,
+                    )
+                else:
+                    self.circuit_breaker.record_failure(sub_agent_id)
+                    self.agent_directory.record_task_outcome(
+                        sub_agent_id, success=False,
+                    )
             else:
                 # Timeout - no result received
                 results.append({
@@ -807,6 +1042,13 @@ Integrate the findings naturally without explicitly mentioning "subtasks" or "su
                     "subtask": delegation.get("subtask", {}),
                     "error": f"Timeout after {timeout_seconds}s",
                 })
+                self.circuit_breaker.record_failure(sub_agent_id)
+                self.agent_directory.record_task_outcome(
+                    sub_agent_id, success=False,
+                )
+
+            # Decrement active tasks in directory
+            self.agent_directory.decrement_active_tasks(sub_agent_id)
 
         return results
 
@@ -830,6 +1072,7 @@ Integrate the findings naturally without explicitly mentioning "subtasks" or "su
         for sub_agent_id in self._spawned_sub_agents:
             try:
                 await self._agent_service.terminate_agent(sub_agent_id)
+                self.agent_directory.unregister(sub_agent_id)
                 logger.debug(f"Terminated sub-agent {sub_agent_id}")
             except Exception as e:
                 logger.error(f"Failed to terminate sub-agent {sub_agent_id}: {e}")
