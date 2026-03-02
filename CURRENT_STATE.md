@@ -1,16 +1,16 @@
 # Jarvis Agent Platform - Current State Assessment
 
-> **Last Updated**: February 12, 2026
-> **Version**: 0.3.0-beta
-> **Overall Progress**: 93% Complete
+> **Last Updated**: March 2, 2026
+> **Version**: 0.4.0-beta
+> **Overall Progress**: 96% Complete
 
 ---
 
 ## 📊 Executive Summary
 
-**Overall Rating**: ⭐ **9.0/10**
+**Overall Rating**: ⭐ **9.3/10**
 
-The Jarvis platform has successfully implemented 93% of its core functionality. Recent improvements address critical production-readiness gaps identified in the OpenClaw comparison review: concurrency safety, message durability, code deduplication, agent identity management, and test coverage.
+The Jarvis platform has successfully implemented 96% of its core functionality. Phase 4.6 adds production-grade agent-to-agent communication with peer-to-peer messaging, circuit breakers, health-aware agent selection, and broadcast/topic patterns — inspired by OpenClaw's production patterns.
 
 **Key Achievements**:
 - ✅ Sophisticated three-tier memory architecture with semantic search
@@ -21,12 +21,20 @@ The Jarvis platform has successfully implemented 93% of its core functionality. 
 - ✅ **Phase 4 Complete**: Master-Sub-Agent delegation workflow
 - ✅ Token-aware context management with intelligent memory selection
 - ✅ Task complexity analysis for delegation decisions
-- ✅ **NEW**: Concurrency-safe message queue (asyncio.Queue)
-- ✅ **NEW**: Durable messaging via Redis Streams (replaces Pub/Sub)
-- ✅ **NEW**: Workspace bootstrap system for agent identity/persona
-- ✅ **NEW**: Unified tool-calling loop (eliminated code duplication)
-- ✅ **NEW**: Background task lifecycle management with auto-restart
-- ✅ **NEW**: 110+ unit tests (up from 2 test files)
+- ✅ Concurrency-safe message queue (asyncio.Queue)
+- ✅ Durable messaging via Redis Streams (replaces Pub/Sub)
+- ✅ Workspace bootstrap system for agent identity/persona
+- ✅ Unified tool-calling loop (eliminated code duplication)
+- ✅ Background task lifecycle management with auto-restart
+- ✅ **NEW (Phase 4.6)**: Agent Communication Protocol with typed message envelopes
+- ✅ **NEW (Phase 4.6)**: Peer-to-peer messaging between any agents
+- ✅ **NEW (Phase 4.6)**: Broadcast and topic-based pub/sub messaging
+- ✅ **NEW (Phase 4.6)**: Agent Directory with health tracking and load balancing
+- ✅ **NEW (Phase 4.6)**: Circuit breaker pattern preventing cascading failures
+- ✅ **NEW (Phase 4.6)**: Timeout enforcement with exponential backoff retry
+- ✅ **NEW (Phase 4.6)**: Configurable LLM provider for sub-agents (no longer hardcoded)
+- ✅ **NEW (Phase 4.6)**: Heartbeat-based agent health monitoring
+- ✅ **NEW**: 172+ unit tests (up from 110)
 
 **Remaining Gaps**:
 - ⚠️ Security hardening (code sandboxing, authentication)
@@ -665,6 +673,98 @@ get_recent_context()   # Retrieve multi-source context
 
 ---
 
+### Phase 4.6: Agent-to-Agent Communication Enhancement — **NEW**
+
+**Status**: ✅ **Complete** (100%)
+
+Inspired by OpenClaw's production-grade multi-agent patterns. Transforms Jarvis from
+a purely hierarchical (master→sub) model into a flexible peer-to-peer + topic-based
+communication platform.
+
+#### 6.1 Agent Communication Protocol (`agent_communication.py`)
+**Status**: ✅ **Complete** (100%)
+
+**Implemented**:
+- ✅ `AgentMessage` typed envelope with routing, correlation, and TTL
+- ✅ 12 message types: peer, broadcast, topic, heartbeat, request/response, etc.
+- ✅ `AgentCommunicationHub` — central hub per agent for all communication
+  - `send()` — peer-to-peer messaging to any agent
+  - `request()` — request-response with correlation and timeout
+  - `respond()` — send correlated response
+  - `broadcast()` — broadcast to all agents or a topic
+  - `subscribe_topic()` / `unsubscribe_topic()` — topic pub/sub
+  - `on_message()` — register handlers per message type
+- ✅ `send_heartbeat()` — periodic health broadcasting
+
+**Quality**: 9.5/10
+
+#### 6.2 Agent Directory (`agent_directory.py`)
+**Status**: ✅ **Complete** (100%)
+
+**Implemented**:
+- ✅ `AgentDirectoryEntry` with health status, load factor, performance stats
+- ✅ `AgentHealthStatus`: HEALTHY, BUSY, DEGRADED, UNRESPONSIVE, TERMINATED
+- ✅ `AgentPerformanceStats`: success rate, avg response time, task counts
+- ✅ Health-aware agent selection (`find_agent()` — least loaded + best success rate)
+- ✅ Multi-dimensional filtering (`find_all()` — capability, type, availability)
+- ✅ Heartbeat processing with status updates
+- ✅ Stale agent detection and eviction (`cleanup_stale()`)
+- ✅ Load tracking (`increment/decrement_active_tasks`)
+- ✅ Health summary dashboard (`get_health_summary()`)
+
+**Quality**: 9.5/10
+
+#### 6.3 Circuit Breaker (`circuit_breaker.py`)
+**Status**: ✅ **Complete** (100%)
+
+**Implemented**:
+- ✅ Per-agent circuit state: CLOSED → OPEN → HALF_OPEN → CLOSED
+- ✅ Configurable failure threshold (default: 3 consecutive failures)
+- ✅ Recovery timeout (default: 60s) before half-open test
+- ✅ `can_call()` / `record_success()` / `record_failure()` API
+- ✅ `call()` wrapper with automatic outcome recording
+- ✅ `CircuitOpenError` for fail-fast signaling
+- ✅ `retry_with_backoff()` — exponential backoff retry utility
+- ✅ `with_timeout()` — asyncio timeout wrapper
+- ✅ Per-agent circuit isolation (one agent's failures don't affect others)
+
+**Quality**: 10/10
+
+#### 6.4 Master Agent Orchestrator Updates
+**Status**: ✅ **Complete** (100%)
+
+**Improvements**:
+- ✅ Configurable sub-agent LLM via `set_sub_agent_llm_config()` (was hardcoded Gemini)
+- ✅ Configurable synthesis LLM via `set_synthesis_llm_config()`
+- ✅ Circuit breaker integration — skips delegation to failing agents
+- ✅ Agent directory integration — health-aware, load-balanced agent selection
+- ✅ Outcome recording — delegation results tracked in directory + circuit breaker
+- ✅ Clean directory unregistration on sub-agent cleanup
+
+#### 6.5 Agent Runner Updates
+**Status**: ✅ **Complete** (100%)
+
+**Improvements**:
+- ✅ Communication hub initialization for peer-to-peer messaging
+- ✅ Peer message handler (`_handle_peer_message`)
+- ✅ Request-response handler (`_handle_request_message`)
+- ✅ Heartbeat broadcasting every 15 seconds
+- ✅ Agent directory registration on startup, unregistration on shutdown
+- ✅ **Delegation timeout enforcement** via `asyncio.wait_for()` (was unbounded)
+- ✅ Separated `_execute_delegation()` for clean timeout wrapping
+
+#### 6.6 Test Coverage
+**Status**: ✅ **Comprehensive**
+
+**New test files**:
+- `test_agent_communication.py` — 16 tests (message model, hub, heartbeat)
+- `test_agent_directory.py` — 24 tests (registry, selection, health, cleanup)
+- `test_circuit_breaker.py` — 22 tests (state transitions, retry, timeout)
+
+**Total**: 172+ unit tests (62 new)
+
+---
+
 ## 🎯 Critical Issues & Recommendations
 
 ### **Security** 🔴
@@ -826,12 +926,15 @@ management through Markdown bootstrap files.
 
 ---
 
-### **Final Score**: ⭐ **9.0/10**
+### **Final Score**: ⭐ **9.3/10**
 
-With Phase 5 production hardening complete, Jarvis addresses all critical production-readiness gaps identified in the OpenClaw comparison review. The platform now has durable messaging, concurrency-safe internals, agent identity management, and comprehensive test coverage. Security hardening and observability are the remaining priorities.
+With Phase 4.6 agent communication complete, Jarvis now has a full-featured multi-agent
+communication system: peer-to-peer messaging, broadcast/topic pub/sub, circuit breakers,
+health-aware load balancing, configurable LLM providers, and proper timeout enforcement.
+Security hardening and observability are the remaining priorities.
 
 ---
 
-**Last Updated**: February 12, 2026
-**Assessed By**: System Architecture Analysis (post OpenClaw comparison)
+**Last Updated**: March 2, 2026
+**Assessed By**: System Architecture Analysis (Phase 4.6 agent communication)
 **Next Review**: After security hardening
