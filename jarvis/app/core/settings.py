@@ -37,6 +37,12 @@ class Settings(BaseSettings):
     anthropic_api_key: str | None = Field(None, description="Anthropic API key for Claude models")
     default_anthropic_model: str = Field("claude-sonnet-4-20250514", description="Default Anthropic model name")
 
+    openrouter_api_key: str | None = Field(None, description="OpenRouter API key (free tier available)")
+    default_openrouter_model: str = Field(
+        "meta-llama/llama-3.1-8b-instruct:free",
+        description="Default OpenRouter model (use :free suffix for free models)",
+    )
+
     api_keys: str = Field("", description="Comma-separated API keys for authentication (empty = no auth)")
 
     max_concurrent_tasks_per_user: int = Field(25, description="Task concurrency guard per user")

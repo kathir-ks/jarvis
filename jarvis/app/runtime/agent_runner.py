@@ -157,7 +157,7 @@ class AgentRunner:
         agent_capabilities = list(self.agent.tools_available) if self.agent.tools_available else []
         self.agent_directory.register(
             agent_id=self.agent_id,
-            agent_type=self.agent.agent_type.value if self.agent.agent_type else "sub_agent",
+            agent_type=self.agent.agent_type if self.agent.agent_type else "sub_agent",
             capabilities=agent_capabilities,
             metadata={
                 "llm_provider": self.agent.config.llm_provider,

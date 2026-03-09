@@ -7,7 +7,7 @@ from typing import Any
 from ..core.settings import get_settings, Settings
 from .base import LLMProvider, LLMResult
 from .gemini_key_manager import GeminiKeyManager
-from .providers import OpenAIProvider, GeminiProvider, AnthropicProvider
+from .providers import OpenAIProvider, GeminiProvider, AnthropicProvider, OpenRouterProvider
 
 logger = logging.getLogger(__name__)
 
@@ -101,6 +101,16 @@ class LLMRouter:
             logger.info("Gemini provider configured with model=%s", self.settings.default_gemini_model)
         else:
             logger.warning("Gemini provider not configured (missing API key).")
+
+        # --- OpenRouter (free models available) ---
+        if self.settings.openrouter_api_key:
+            providers["openrouter"] = OpenRouterProvider(
+                api_key=self.settings.openrouter_api_key,
+                default_model=self.settings.default_openrouter_model,
+            )
+            logger.info("OpenRouter provider configured with model=%s", self.settings.default_openrouter_model)
+        else:
+            logger.warning("OpenRouter provider not configured (missing API key).")
 
         # --- Anthropic ---
         if self.settings.anthropic_api_key:
