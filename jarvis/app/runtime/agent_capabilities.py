@@ -6,6 +6,7 @@ Prepares for Phase 4 multi-agent collaboration.
 """
 import logging
 from typing import Any
+
 from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
@@ -111,6 +112,7 @@ class AgentCapabilitiesRegistry:
     - Capability registration per agent
     - Discovery of capable agents
     - Capability matching for delegation
+    - MongoDB persistence (write-through with in-memory cache)
     """
 
     def __init__(self, storage: dict[str, list[str]] | None = None):
@@ -118,11 +120,10 @@ class AgentCapabilitiesRegistry:
         Initialize capabilities registry.
 
         Args:
-            storage: Optional in-memory storage (for testing)
-                     In production, this would use MongoDB or Redis
+            storage: Optional in-memory storage (for testing).
+                     If provided, MongoDB persistence is skipped.
         """
-        # In-memory storage: agent_id -> list of capability_ids
-        # TODO: Replace with MongoDB or Redis in production
+        # In-memory cache: agent_id -> list of capability_ids
         self._agent_capabilities: dict[str, list[str]] = storage or {}
 
         # Capability definitions
@@ -131,13 +132,62 @@ class AgentCapabilitiesRegistry:
             for cap in STANDARD_CAPABILITIES.values()
         }
 
+        # Repository for persistence (lazy-initialized)
+        self._repo: Any = None
+        self._use_persistence = storage is None
+
+    def _get_repo(self) -> Any:
+        """Lazy-initialize the CapabilityRepository."""
+        if self._repo is None and self._use_persistence:
+            try:
+                from ..db.repositories import CapabilityRepository
+                self._repo = CapabilityRepository()
+            except Exception as e:
+                logger.warning(f"Could not initialize CapabilityRepository: {e}")
+                self._use_persistence = False
+        return self._repo
+
+    async def load_from_db(self) -> None:
+        """
+        Load all capabilities from MongoDB into the in-memory cache.
+
+        Call this during application startup to restore persisted state.
+        """
+        repo = self._get_repo()
+        if not repo:
+            return
+
+        try:
+            all_capabilities = await repo.load_all()
+            self._agent_capabilities.update(all_capabilities)
+            logger.info(
+                f"Loaded capabilities for {len(all_capabilities)} agents from database"
+            )
+        except Exception as e:
+            logger.warning(f"Failed to load capabilities from database: {e}")
+
+    async def _persist(self, agent_id: str) -> None:
+        """Write-through: persist agent capabilities to MongoDB."""
+        repo = self._get_repo()
+        if not repo:
+            return
+
+        try:
+            capabilities = self._agent_capabilities.get(agent_id, [])
+            await repo.save_capabilities(agent_id, capabilities)
+        except Exception as e:
+            logger.warning(f"Failed to persist capabilities for {agent_id}: {e}")
+
     def register_capability(
         self,
         agent_id: str,
         capability: AgentCapability | str,
     ) -> None:
         """
-        Register a capability for an agent.
+        Register a capability for an agent (synchronous, in-memory only).
+
+        For persistence, use ``register_capability_async`` instead, or
+        call ``_persist`` after this method in an async context.
 
         Args:
             agent_id: The agent ID
@@ -166,6 +216,21 @@ class AgentCapabilitiesRegistry:
                 f"Registered capability '{capability_id}' for agent {agent_id}"
             )
 
+    async def register_capability_async(
+        self,
+        agent_id: str,
+        capability: AgentCapability | str,
+    ) -> None:
+        """
+        Register a capability and persist to MongoDB.
+
+        Args:
+            agent_id: The agent ID
+            capability: Capability object or capability_id string
+        """
+        self.register_capability(agent_id, capability)
+        await self._persist(agent_id)
+
     def register_multiple(
         self,
         agent_id: str,
@@ -187,7 +252,7 @@ class AgentCapabilitiesRegistry:
         capability_id: str,
     ) -> bool:
         """
-        Unregister a capability from an agent.
+        Unregister a capability from an agent (synchronous, in-memory only).
 
         Args:
             agent_id: The agent ID
@@ -204,6 +269,26 @@ class AgentCapabilitiesRegistry:
                 )
                 return True
         return False
+
+    async def unregister_capability_async(
+        self,
+        agent_id: str,
+        capability_id: str,
+    ) -> bool:
+        """
+        Unregister a capability and persist the change.
+
+        Args:
+            agent_id: The agent ID
+            capability_id: The capability ID
+
+        Returns:
+            True if removed, False if not found
+        """
+        removed = self.unregister_capability(agent_id, capability_id)
+        if removed:
+            await self._persist(agent_id)
+        return removed
 
     def get_agent_capabilities(self, agent_id: str) -> list[AgentCapability]:
         """
@@ -315,7 +400,7 @@ class AgentCapabilitiesRegistry:
         available_tools: list[str],
     ) -> list[str]:
         """
-        Automatically register capabilities based on available tools.
+        Automatically register capabilities based on available tools (sync).
 
         Args:
             agent_id: The agent ID
@@ -339,6 +424,26 @@ class AgentCapabilitiesRegistry:
             f"Auto-registered {len(registered)} capabilities for agent {agent_id}: "
             f"{registered}"
         )
+        return registered
+
+    async def auto_register_from_tools_async(
+        self,
+        agent_id: str,
+        available_tools: list[str],
+    ) -> list[str]:
+        """
+        Automatically register capabilities and persist to MongoDB.
+
+        Args:
+            agent_id: The agent ID
+            available_tools: List of tool names the agent has access to
+
+        Returns:
+            List of registered capability IDs
+        """
+        registered = self.auto_register_from_tools(agent_id, available_tools)
+        if registered:
+            await self._persist(agent_id)
         return registered
 
 

@@ -6,6 +6,7 @@ from datetime import datetime
 from typing import Any
 
 from ..runtime.agent import Agent
+from ..runtime.workspace_bootstrap import get_workspace_bootstrap
 from .token_counter import get_token_counter
 from ..runtime.memory_selector import get_memory_selector
 
@@ -25,6 +26,7 @@ class PromptBuilder:
         """Initialize prompt builder with token counter and memory selector."""
         self.token_counter = get_token_counter()
         self.memory_selector = get_memory_selector()
+        self.workspace_bootstrap = get_workspace_bootstrap()
 
     def build_agent_messages(
         self,
@@ -44,8 +46,13 @@ class PromptBuilder:
         Returns:
             List of chat messages for LLM
         """
+        # Build system prompt with workspace bootstrap (agent identity + persona)
+        system_prompt = self.workspace_bootstrap.build_system_prompt(
+            agent_id=agent.agent_id,
+            base_prompt=self.BASE_SYSTEM_PROMPT,
+        )
         system_messages = [
-            {"role": "system", "content": self.BASE_SYSTEM_PROMPT},
+            {"role": "system", "content": system_prompt},
         ]
 
         # Add short-term memory (recent interactions)
@@ -468,6 +475,148 @@ class PromptBuilder:
         )
 
         return truncated
+
+    def build_delegation_messages(
+        self,
+        agent: Agent,
+        delegation_context: dict[str, Any],
+        long_term_context: dict[str, list[Any]] | None = None,
+    ) -> list[dict[str, str]]:
+        """
+        Build prompt messages for sub-agent delegation execution.
+
+        Unlike normal conversation prompts, delegation prompts:
+        - Use a sub-agent-specific system prompt that clarifies the agent's role
+        - Include the parent task description for broader context
+        - Include results from sibling subtasks (for sequential workflows)
+        - Include the master's conversation summary for continuity
+
+        Args:
+            agent: The sub-agent entity
+            delegation_context: DelegationContext dict containing:
+                - parent_task_description: The overall task
+                - subtask_description: This agent's focused task
+                - parent_short_term_summary: Master's conversation history
+                - parent_session_context: Master's session state
+                - sibling_results: Results from prior subtasks
+                - subtask_index: Position in sequence
+                - total_subtasks: Total subtask count
+            long_term_context: Optional long-term memory from vector store
+
+        Returns:
+            List of chat messages for LLM
+        """
+        parent_task = delegation_context.get("parent_task_description", "")
+        subtask = delegation_context.get("subtask_description", "")
+        subtask_index = delegation_context.get("subtask_index", 0)
+        total_subtasks = delegation_context.get("total_subtasks", 1)
+        parent_summary = delegation_context.get("parent_short_term_summary", "")
+        parent_context = delegation_context.get("parent_session_context", {})
+        sibling_results = delegation_context.get("sibling_results", [])
+
+        # Build sub-agent-specific system prompt
+        system_prompt = (
+            "You are a specialized sub-agent within the Jarvis AI platform. "
+            "You have been delegated a specific subtask as part of a larger task. "
+            "Focus on completing your subtask thoroughly and accurately. "
+            "Provide detailed, actionable results that can be integrated with "
+            "other sub-agents' work."
+        )
+
+        system_messages = [
+            {"role": "system", "content": system_prompt},
+        ]
+
+        # Add parent task context so the sub-agent understands the bigger picture
+        if parent_task:
+            task_context = (
+                f"== Overall Task ==\n"
+                f"You are working on subtask {subtask_index + 1} of {total_subtasks}.\n"
+                f"The user's original request: {parent_task}"
+            )
+            system_messages.append(
+                {"role": "system", "content": task_context}
+            )
+
+        # Add master's conversation summary for continuity
+        if parent_summary:
+            system_messages.append({
+                "role": "system",
+                "content": f"== Master Agent Conversation History ==\n{parent_summary}",
+            })
+
+        # Add results from sibling subtasks (critical for sequential workflows)
+        if sibling_results:
+            sibling_text = self._format_sibling_results(sibling_results)
+            if sibling_text:
+                system_messages.append({
+                    "role": "system",
+                    "content": f"== Results from Prior Subtasks ==\n{sibling_text}",
+                })
+
+        # Add parent session context if available
+        if parent_context:
+            ctx_parts = []
+            for key, value in parent_context.items():
+                ctx_parts.append(f"- {key}: {value}")
+            if ctx_parts:
+                system_messages.append({
+                    "role": "system",
+                    "content": f"== Session Context ==\n" + "\n".join(ctx_parts),
+                })
+
+        # Add long-term memory if available
+        if long_term_context:
+            long_term_text = self._summarize_long_term_context(long_term_context)
+            if long_term_text:
+                system_messages.append({
+                    "role": "system",
+                    "content": f"Relevant long-term memory:\n{long_term_text}",
+                })
+
+        # The subtask description becomes the user message
+        messages = [*system_messages, {"role": "user", "content": subtask}]
+
+        logger.info(
+            f"Built delegation prompt: {len(messages)} messages, "
+            f"subtask {subtask_index + 1}/{total_subtasks}"
+        )
+
+        return messages
+
+    def _format_sibling_results(
+        self,
+        sibling_results: list[dict[str, Any]],
+    ) -> str:
+        """
+        Format results from previously completed sibling subtasks.
+
+        Args:
+            sibling_results: List of result dicts with capability, status, output_summary
+
+        Returns:
+            Formatted string for prompt inclusion
+        """
+        if not sibling_results:
+            return ""
+
+        parts = []
+        for i, result in enumerate(sibling_results, 1):
+            capability = result.get("capability", "unknown")
+            status = result.get("status", "unknown")
+            output = result.get("output_summary", "")
+
+            if status == "completed" and output:
+                parts.append(
+                    f"Subtask {i} ({capability}) - Completed:\n{output}"
+                )
+            elif status in ("failed", "timeout"):
+                error = result.get("error", "Unknown error")
+                parts.append(
+                    f"Subtask {i} ({capability}) - {status}: {error}"
+                )
+
+        return "\n\n".join(parts)
 
     @staticmethod
     def _fmt_time(value: Any) -> str:

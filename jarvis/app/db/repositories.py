@@ -186,3 +186,80 @@ class TaskRepository:
     async def delete(self, task_id: str) -> None:
         """Delete task."""
         await self.collection.delete_one({"_id": task_id})
+
+
+class CapabilityRepository:
+    """Repository for persisting agent capabilities to MongoDB.
+
+    Stores capability registrations so they survive agent restarts.
+    Each document maps an agent_id to its list of capability_ids.
+    """
+
+    def __init__(self):
+        self.db = get_mongo_db()
+        self.collection: AsyncIOMotorCollection = self.db["agent_capabilities"]
+
+    async def save_capabilities(
+        self,
+        agent_id: str,
+        capability_ids: list[str],
+    ) -> None:
+        """
+        Save or update capabilities for an agent.
+
+        Uses upsert so it works for both new and existing agents.
+
+        Args:
+            agent_id: The agent ID
+            capability_ids: List of capability IDs the agent possesses
+        """
+        await self.collection.update_one(
+            {"_id": agent_id},
+            {
+                "$set": {
+                    "capability_ids": capability_ids,
+                    "updated_at": datetime.utcnow(),
+                }
+            },
+            upsert=True,
+        )
+        logger.debug(f"Saved capabilities for agent {agent_id}: {capability_ids}")
+
+    async def load_capabilities(self, agent_id: str) -> list[str]:
+        """
+        Load capabilities for an agent.
+
+        Args:
+            agent_id: The agent ID
+
+        Returns:
+            List of capability IDs, or empty list if not found
+        """
+        doc = await self.collection.find_one({"_id": agent_id})
+        if not doc:
+            return []
+        return doc.get("capability_ids", [])
+
+    async def load_all(self) -> dict[str, list[str]]:
+        """
+        Load all agent capabilities from the database.
+
+        Returns:
+            Dict mapping agent_id to list of capability_ids
+        """
+        result: dict[str, list[str]] = {}
+        cursor = self.collection.find({})
+        async for doc in cursor:
+            agent_id = doc["_id"]
+            result[agent_id] = doc.get("capability_ids", [])
+        return result
+
+    async def delete_agent_capabilities(self, agent_id: str) -> None:
+        """
+        Remove all capabilities for an agent.
+
+        Args:
+            agent_id: The agent ID
+        """
+        await self.collection.delete_one({"_id": agent_id})
+        logger.debug(f"Deleted capabilities for agent {agent_id}")
