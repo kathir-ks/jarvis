@@ -22,7 +22,17 @@ class Settings(BaseSettings):
     default_llm_model: str = Field("gpt-4o-mini", description="Default LLM model name")
     openai_api_key: str | None = Field(None, description="OpenAI API key for LLM calls")
     gemini_api_key: str | None = Field(None, description="Google Gemini API key for LLM calls")
+    gemini_api_keys: str | None = Field(
+        None,
+        description="Comma-separated Gemini API keys for multi-account rotation",
+    )
     default_gemini_model: str = Field("gemini-2.0-flash-exp", description="Default Gemini model name")
+    gemini_requests_per_key_per_model: int = Field(
+        20, description="Max requests per Gemini key per model per day",
+    )
+    gemini_max_models_per_key: int = Field(
+        3, description="Max distinct models a single Gemini key may use per day",
+    )
 
     max_concurrent_tasks_per_user: int = Field(25, description="Task concurrency guard per user")
     task_max_duration_seconds: int = Field(300, description="Default task timeout")
