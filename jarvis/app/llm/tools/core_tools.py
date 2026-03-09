@@ -4,10 +4,10 @@ from __future__ import annotations
 import logging
 from typing import Any
 from datetime import datetime, timezone
-import json
-import sys
-from io import StringIO
 import math
+import os
+import sys
+import tempfile
 
 from ..tool_registry import (
     ToolDefinition,
@@ -92,89 +92,76 @@ CALCULATOR_TOOL = ToolDefinition(
 
 
 # Tool Handlers
+_MAX_OUTPUT_BYTES = 64 * 1024
+
+
 async def execute_code_handler(params: dict[str, Any]) -> dict[str, Any]:
-    """Execute Python code in a restricted environment."""
+    """Execute Python code in an isolated subprocess with stripped environment."""
+    import asyncio
+
     code = params["code"]
     timeout = min(params.get("timeout", 10), 30)  # Cap at 30 seconds
 
-    logger.info("Executing code (timeout=%ds)", timeout)
-
-    # Capture stdout and stderr
-    old_stdout = sys.stdout
-    old_stderr = sys.stderr
-    stdout_capture = StringIO()
-    stderr_capture = StringIO()
-
-    success = False
-    error_msg = None
+    logger.info("Executing code in subprocess (timeout=%ds)", timeout)
 
     try:
-        sys.stdout = stdout_capture
-        sys.stderr = stderr_capture
+        # Write code to a temp file
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".py", delete=False, encoding="utf-8",
+        ) as f:
+            f.write(code)
+            tmp_path = f.name
 
-        # Create restricted globals (no file I/O, no imports except safe ones)
-        safe_globals = {
-            "__builtins__": {
-                # Safe built-ins only
-                "abs": abs,
-                "all": all,
-                "any": any,
-                "bool": bool,
-                "dict": dict,
-                "enumerate": enumerate,
-                "float": float,
-                "int": int,
-                "len": len,
-                "list": list,
-                "max": max,
-                "min": min,
-                "print": print,
-                "range": range,
-                "round": round,
-                "set": set,
-                "sorted": sorted,
-                "str": str,
-                "sum": sum,
-                "tuple": tuple,
-                "zip": zip,
-                # Math module
-                "math": math,
-            }
-        }
+        # Minimal env — strips all secrets / credentials
+        env = {"PATH": os.environ.get("PATH", "")}
 
-        # Execute with timeout
-        import asyncio
-
-        def _exec():
-            exec(code, safe_globals)
-
-        await asyncio.wait_for(
-            asyncio.get_event_loop().run_in_executor(None, _exec),
-            timeout=timeout
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable, tmp_path,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=env,
         )
 
-        success = True
+        try:
+            stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                proc.communicate(), timeout=timeout,
+            )
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.communicate()
+            return {
+                "success": False,
+                "stdout": "",
+                "stderr": None,
+                "error": f"Code execution timed out after {timeout}s",
+            }
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
 
-    except asyncio.TimeoutError:
-        error_msg = f"Code execution timed out after {timeout}s"
+        stdout_text = stdout_bytes.decode("utf-8", errors="replace")[:_MAX_OUTPUT_BYTES]
+        stderr_text = stderr_bytes.decode("utf-8", errors="replace")[:_MAX_OUTPUT_BYTES]
+        success = proc.returncode == 0
+
+        result = {
+            "success": success,
+            "stdout": stdout_text,
+            "stderr": stderr_text if stderr_text else None,
+            "error": stderr_text if not success else None,
+        }
+
+        logger.info("Code execution completed: success=%s", success)
+        return result
+
     except Exception as e:
-        error_msg = f"{type(e).__name__}: {str(e)}"
-    finally:
-        sys.stdout = old_stdout
-        sys.stderr = old_stderr
-
-    stdout_text = stdout_capture.getvalue()
-    stderr_text = stderr_capture.getvalue()
-
-    result = {
-        "success": success,
-        "stdout": stdout_text,
-        "stderr": stderr_text if stderr_text else None,
-        "error": error_msg,
-    }
-
-    logger.info("Code execution completed: success=%s", success)
-    return result
+        return {
+            "success": False,
+            "stdout": "",
+            "stderr": None,
+            "error": f"{type(e).__name__}: {str(e)}",
+        }
 
 
 async def get_time_handler(params: dict[str, Any]) -> dict[str, Any]:

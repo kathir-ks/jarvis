@@ -153,10 +153,19 @@ class TestExecuteCode:
         assert result["success"] is True
 
     @pytest.mark.asyncio
-    async def test_no_import_access(self):
-        """Code shouldn't be able to import arbitrary modules."""
-        result = await execute_code_handler({"code": "import os\nprint(os.getcwd())"})
-        assert result["success"] is False
+    async def test_subprocess_env_isolation(self):
+        """Subprocess should not inherit sensitive env vars."""
+        import os
+
+        os.environ["JARVIS_SECRET_TEST"] = "sensitive-value"
+        try:
+            result = await execute_code_handler({
+                "code": "import os\nval = os.environ.get('JARVIS_SECRET_TEST', '')\nprint(f'found:{val}')",
+            })
+            assert result["success"] is True
+            assert "sensitive-value" not in result["stdout"]
+        finally:
+            os.environ.pop("JARVIS_SECRET_TEST", None)
 
 
 # ---------------------------------------------------------------------------

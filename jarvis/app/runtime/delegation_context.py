@@ -311,9 +311,10 @@ class DelegationContextManager:
             await vector_memory.store_knowledge(
                 content=knowledge_content,
                 agent_id=agent_id,
-                user_id=user_id,
+                knowledge_type="delegation_result",
+                confidence=1.0 if status == "completed" else 0.5,
                 metadata={
-                    "knowledge_type": "delegation_result",
+                    "user_id": user_id,
                     "task_description": task_description[:200],
                     "status": status,
                     "successful_count": successful,

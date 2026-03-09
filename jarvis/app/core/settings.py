@@ -34,6 +34,11 @@ class Settings(BaseSettings):
         3, description="Max distinct models a single Gemini key may use per day",
     )
 
+    anthropic_api_key: str | None = Field(None, description="Anthropic API key for Claude models")
+    default_anthropic_model: str = Field("claude-sonnet-4-20250514", description="Default Anthropic model name")
+
+    api_keys: str = Field("", description="Comma-separated API keys for authentication (empty = no auth)")
+
     max_concurrent_tasks_per_user: int = Field(25, description="Task concurrency guard per user")
     task_max_duration_seconds: int = Field(300, description="Default task timeout")
     task_max_retries: int = Field(3, description="Default task retries")

@@ -270,8 +270,8 @@ class TestDelegationContextManager:
 
         assert "Python best practices" in call_kwargs["content"]
         assert call_kwargs["agent_id"] == "master_001"
-        assert call_kwargs["user_id"] == "user_001"
-        assert call_kwargs["metadata"]["knowledge_type"] == "delegation_result"
+        assert call_kwargs["knowledge_type"] == "delegation_result"
+        assert call_kwargs["metadata"]["user_id"] == "user_001"
         assert call_kwargs["metadata"]["status"] == "completed"
 
     @pytest.mark.asyncio

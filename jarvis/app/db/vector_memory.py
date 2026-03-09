@@ -1,6 +1,7 @@
 """Vector memory service using Qdrant for long-term agent memory."""
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
 from dataclasses import dataclass, field
@@ -89,12 +90,13 @@ class VectorMemoryService:
         for collection_name in collections:
             try:
                 # Check if collection exists
-                self.client.get_collection(collection_name)
+                await asyncio.to_thread(self.client.get_collection, collection_name)
                 logger.debug("Collection %s already exists", collection_name)
             except (UnexpectedResponse, Exception):
                 # Create collection
                 logger.info("Creating collection: %s", collection_name)
-                self.client.create_collection(
+                await asyncio.to_thread(
+                    self.client.create_collection,
                     collection_name=collection_name,
                     vectors_config=qdrant_models.VectorParams(
                         size=VECTOR_DIMENSIONS,
@@ -145,7 +147,8 @@ class VectorMemoryService:
         }
         
         # Store in Qdrant
-        self.client.upsert(
+        await asyncio.to_thread(
+            self.client.upsert,
             collection_name=COLLECTION_USER_INTERACTIONS,
             points=[
                 qdrant_models.PointStruct(
@@ -213,7 +216,8 @@ class VectorMemoryService:
             **(metadata or {}),
         }
         
-        self.client.upsert(
+        await asyncio.to_thread(
+            self.client.upsert,
             collection_name=COLLECTION_CONTENT_DISCOVERIES,
             points=[
                 qdrant_models.PointStruct(
@@ -275,7 +279,8 @@ class VectorMemoryService:
             **(metadata or {}),
         }
         
-        self.client.upsert(
+        await asyncio.to_thread(
+            self.client.upsert,
             collection_name=COLLECTION_AGENT_KNOWLEDGE,
             points=[
                 qdrant_models.PointStruct(
@@ -538,7 +543,8 @@ class VectorMemoryService:
         
         for collection in [COLLECTION_USER_INTERACTIONS, COLLECTION_CONTENT_DISCOVERIES, COLLECTION_AGENT_KNOWLEDGE]:
             try:
-                result = self.client.delete(
+                result = await asyncio.to_thread(
+                    self.client.delete,
                     collection_name=collection,
                     points_selector=qdrant_models.FilterSelector(
                         filter=qdrant_models.Filter(
@@ -573,7 +579,8 @@ class VectorMemoryService:
         embedding_result = await self.embedding_provider.embed(query)
         
         # Search Qdrant
-        results = self.client.search(
+        results = await asyncio.to_thread(
+            self.client.search,
             collection_name=collection_name,
             query_vector=embedding_result.vector,
             query_filter=filters,

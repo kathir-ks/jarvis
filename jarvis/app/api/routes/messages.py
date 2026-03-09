@@ -20,6 +20,10 @@ async def send_message(
 
 
 @router.get("/history", response_model=dict)
-async def get_message_history(agent_id: str | None = None, thread_id: str | None = None):
-    # Placeholder for history fetch
-    return {"data": [], "next_cursor": None}
+async def get_message_history(
+    agent_id: str | None = None,
+    thread_id: str | None = None,
+    limit: int = 50,
+    service: MessageService = Depends(get_message_service),
+):
+    return await service.get_history(agent_id=agent_id, thread_id=thread_id, limit=limit)

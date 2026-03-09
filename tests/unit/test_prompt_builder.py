@@ -185,7 +185,7 @@ class TestDelegationMessages:
              patch("jarvis.app.llm.prompt_builder.get_token_counter"), \
              patch("jarvis.app.llm.prompt_builder.get_memory_selector"):
             mock_ws = MagicMock()
-            mock_ws.build_system_prompt.return_value = "System"
+            mock_ws.build_system_prompt.side_effect = lambda **kw: kw.get("base_prompt", "System")
             mock_ws_fn.return_value = mock_ws
 
             builder = PromptBuilder()

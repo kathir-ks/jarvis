@@ -2,6 +2,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from .auth import ApiKeyMiddleware
 from .logging import configure_logging
 from .settings import get_settings
 from ..api.routes import agents, health, messages, tasks, mcp
@@ -16,6 +17,9 @@ def create_app() -> FastAPI:
     initialize_tools()
 
     app = FastAPI(title=settings.app_name, version="0.1.0")
+
+    # API key authentication (no-op when JARVIS_API_KEYS is empty)
+    app.add_middleware(ApiKeyMiddleware)
 
     app.add_middleware(
         CORSMiddleware,

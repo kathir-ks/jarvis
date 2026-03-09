@@ -7,7 +7,7 @@ from typing import Any
 from ..core.settings import get_settings, Settings
 from .base import LLMProvider, LLMResult
 from .gemini_key_manager import GeminiKeyManager
-from .providers import OpenAIProvider, GeminiProvider
+from .providers import OpenAIProvider, GeminiProvider, AnthropicProvider
 
 logger = logging.getLogger(__name__)
 
@@ -102,7 +102,17 @@ class LLMRouter:
         else:
             logger.warning("Gemini provider not configured (missing API key).")
 
+        # --- Anthropic ---
+        if self.settings.anthropic_api_key:
+            providers["anthropic"] = AnthropicProvider(
+                api_key=self.settings.anthropic_api_key,
+                default_model=self.settings.default_anthropic_model,
+            )
+            logger.info("Anthropic provider configured with model=%s", self.settings.default_anthropic_model)
+        else:
+            logger.warning("Anthropic provider not configured (missing API key).")
+
         if not providers:
-            logger.error("No LLM providers configured! Please set JARVIS_OPENAI_API_KEY or JARVIS_GEMINI_API_KEY")
+            logger.error("No LLM providers configured! Please set JARVIS_OPENAI_API_KEY, JARVIS_GEMINI_API_KEY, or JARVIS_ANTHROPIC_API_KEY")
 
         return providers
