@@ -26,7 +26,7 @@ class Settings(BaseSettings):
         None,
         description="Comma-separated Gemini API keys for multi-account rotation",
     )
-    default_gemini_model: str = Field("gemini-2.0-flash-exp", description="Default Gemini model name")
+    default_gemini_model: str = Field("gemini-2.0-flash", description="Default Gemini model name")
     gemini_requests_per_key_per_model: int = Field(
         20, description="Max requests per Gemini key per model per day",
     )
@@ -39,7 +39,7 @@ class Settings(BaseSettings):
 
     openrouter_api_key: str | None = Field(None, description="OpenRouter API key (free tier available)")
     default_openrouter_model: str = Field(
-        "meta-llama/llama-3.1-8b-instruct:free",
+        "meta-llama/llama-3.3-70b-instruct:free",
         description="Default OpenRouter model (use :free suffix for free models)",
     )
 
