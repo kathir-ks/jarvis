@@ -13,15 +13,17 @@
 - **Collaborate**: Multiple agents work together, with master agents delegating to specialized sub-agents
 - **Use Tools**: Execute code, search the web, read URLs, perform calculations, and more
 - **Maintain Memory**: Short-term (in-memory) and long-term (vector database) memory for context retention
-- **Communicate**: Inter-agent messaging via Redis Pub/Sub for real-time coordination
+- **Communicate**: Inter-agent messaging via Redis Streams or in-memory broker for real-time coordination
 - **Execute Tasks**: DAG-based task execution with dependency management and parallel processing
 - **Integrate via MCP**: Expose and discover tools through the Model Context Protocol
+- **Run Anywhere**: Lite mode runs agents without MongoDB/Redis/Qdrant — ideal for demos and local development
 
 ### Use Cases
 - Research tasks requiring web search and data aggregation
 - Multi-step workflows with dependencies (e.g., research → plan → execute)
 - Autonomous task delegation (master agent spawns specialized sub-agents)
 - Complex decision-making requiring LLM reasoning with tool access
+- **Multi-user agent deployment** — separate agents per user (kathir, akilesh, aswin) communicating via a shared platform
 
 ---
 
@@ -75,8 +77,8 @@
 │  │ │ OpenAI │ │  │ │execute_│ │  │            │                │
 │  │ │ Gemini │ │  │ │  code  │ │  │            │                │
 │  │ │Anthropic│ │  │ │web_srch│ │  │            │                │
-│  │ └────────┘ │  │ │read_url│ │  │            │                │
-│  │            │  │ │calcultr│ │  │            │                │
+│  │ │OpenRoutr│ │  │ │read_url│ │  │            │                │
+│  │ └────────┘ │  │ │calcultr│ │  │            │                │
 │  │            │  │ │get_time│ │  │            │                │
 │  └────────────┘  └────────────┘  └────────────┘                │
 └─────────────────────────────────────────────────────────────────┘
@@ -86,10 +88,52 @@
 │                    Data/Infrastructure Layer                     │
 │  ┌────────────┐  ┌────────────┐  ┌────────────┐                │
 │  │  MongoDB   │  │   Redis    │  │  Qdrant    │                │
-│  │ (Agents &  │  │ (Pub/Sub & │  │  (Vector   │                │
+│  │ (Agents &  │  │ (Streams & │  │  (Vector   │                │
 │  │   Tasks)   │  │  Messaging)│  │   Memory)  │                │
 │  └────────────┘  └────────────┘  └────────────┘                │
+│                   OR                                             │
+│  ┌──────────────────────────────────────────────┐               │
+│  │  Lite Mode (zero infrastructure)             │               │
+│  │  InMemoryBroker + InMemoryAgentRepository    │               │
+│  └──────────────────────────────────────────────┘               │
 └─────────────────────────────────────────────────────────────────┘
+```
+
+### Multi-User Platform Topology
+
+```
+             PRODUCTION TOPOLOGY (future)
+
+  ┌────────────────────────────────────────────────┐
+  │     COMMUNICATION PLATFORM (port 9000)         │
+  │  ┌──────────────┐  ┌──────────────────────┐   │
+  │  │ MessageBroker│  │ AgentDirectory       │   │
+  │  │ (InMemory or │  │ (user-aware)         │   │
+  │  │  Redis)      │  │                      │   │
+  │  └──────────────┘  └──────────────────────┘   │
+  │  ┌────────────────────────────────────────┐   │
+  │  │ REST API: /register, /send, /poll, /dir│   │
+  │  └────────────────────────────────────────┘   │
+  └────────────────────┬───────────────────────────┘
+                       │ HTTP
+        ┌──────────────┼──────────────┐
+        ▼              ▼              ▼
+  ┌───────────┐  ┌───────────┐  ┌───────────┐
+  │ kathir's  │  │ akilesh's │  │ aswin's   │
+  │ Runner    │  │ Runner    │  │ Runner    │
+  │ (proc 1)  │  │ (proc 2)  │  │ (proc 3)  │
+  └───────────┘  └───────────┘  └───────────┘
+
+              DEV/DEMO MODE (single process)
+
+  ┌──────────────────────────────────────────────┐
+  │  Shared InMemoryBroker + AgentDirectory      │
+  │  ┌──────────┐  ┌──────────┐  ┌──────────┐  │
+  │  │ kathir's │  │akilesh's │  │ aswin's  │  │
+  │  │ runner   │  │ runner   │  │ runner   │  │
+  │  └──────────┘  └──────────┘  └──────────┘  │
+  │  All via InMemoryBroker — zero network I/O  │
+  └──────────────────────────────────────────────┘
 ```
 
 ---
@@ -246,9 +290,14 @@
 - Time-weighted relevance scoring
 - Memory consolidation from short-term storage
 
-### 9. **Messaging System** (`jarvis/app/messaging/broker.py`)
+### 9. **Messaging System** (`jarvis/app/messaging/`)
 
-**Purpose**: Inter-agent communication via Redis Pub/Sub.
+**Purpose**: Inter-agent communication via Redis Streams or in-memory broker.
+
+**Components**:
+- **MessageBrokerProtocol** (`broker_interface.py`): Abstract protocol for broker implementations
+- **MessageBroker** (`broker.py`): Redis Streams-backed durable broker (production)
+- **InMemoryMessageBroker** (`jarvis/app/lite/memory_broker.py`): `asyncio`-based drop-in (demo/dev)
 
 **Features**:
 - Message routing to agent inboxes
@@ -271,6 +320,51 @@
 - Status transitions
 - Retry tracking
 - Dependency queries
+
+### 11. **Lite Infrastructure** (`jarvis/app/lite/`)
+
+**Purpose**: Zero-dependency replacements for MongoDB/Redis/Qdrant, enabling agents to run without any external services.
+
+**Components**:
+- **InMemoryMessageBroker** (`memory_broker.py`): `asyncio.Queue`-based broker with publish/subscribe/replay
+- **InMemoryAgentRepository** (`memory_repo.py`): Dict-backed agent CRUD with same async API as `AgentRepository`
+
+### 12. **LiteAgentRunner** (`jarvis/app/runtime/lite_agent_runner.py`)
+
+**Purpose**: Lightweight agent event loop that replaces the full `AgentRunner` for infrastructure-free operation.
+
+**Key Features**:
+- Constructor injection of broker, LLM provider, directory (no global singletons)
+- Interactive `chat()` method for direct user interaction
+- Auto-responds to incoming peer/broadcast messages via the LLM
+- Registers in `AgentDirectory` with `user_id` for multi-user filtering
+- Heartbeat broadcasting in background `run()` loop
+- All memory kept in-process on the `Agent` object (no Qdrant needed)
+
+### 13. **Communication Platform** (`jarvis/app/platform/`)
+
+**Purpose**: Standalone multi-agent messaging and discovery service.
+
+**Components**:
+- **CommunicationPlatformService** (`service.py`): Business logic wrapping broker + directory
+- **Platform API** (`api.py`): FastAPI router with 7 REST endpoints
+- **Pydantic Models** (`models.py`): Request/response schemas
+- **App Factory** (`app.py`): `create_platform_app()` for standalone or embedded use
+
+**API Endpoints** (port 9000):
+- `POST /api/v1/agents/register` — Register agent with user_id, capabilities
+- `POST /api/v1/agents/unregister` — Remove agent from directory
+- `POST /api/v1/messages/send` — Route message between agents
+- `POST /api/v1/messages/broadcast` — Broadcast to all agents or topic
+- `POST /api/v1/heartbeat` — Agent health heartbeat
+- `GET  /api/v1/directory/agents` — List agents (filter by user_id, capability)
+- `GET  /api/v1/health` — Platform health status
+
+### 14. **Entry Points** (root-level scripts)
+
+- **`run_platform.py`**: Starts Communication Platform as standalone FastAPI service
+- **`run_agent.py`**: Starts a single `LiteAgentRunner` with interactive REPL
+- **`run_multi_agent_demo.py`**: Single-process demo — 3 agents for kathir, akilesh, aswin with shared `InMemoryBroker`
 
 ---
 
@@ -446,19 +540,30 @@ Agent sends result back to LLM
 - ✅ Agent MCP Integration (discovery & execution)
 - ✅ MCP Client (HTTP-based with fallback)
 
-### ⏳ In Progress (25% remaining)
-
 **Phase 4: Agent-to-Agent Communication**
-- 🔲 Agent Discovery (shared registry, capability queries)
-- 🔲 Message Protocol (inter-agent message format)
-- 🔲 Collaboration Patterns (master-subagent delegation)
+- ✅ Agent Discovery (shared registry, capability queries)
+- ✅ Message Protocol (typed envelopes, peer-to-peer, broadcast)
+- ✅ Collaboration Patterns (master-subagent delegation)
+- ✅ Circuit Breaker (prevents cascading failures)
+- ✅ Agent Directory (health-aware load-balanced selection)
+- ✅ Heartbeat-based health monitoring
+
+**Phase 5: Multi-User Platform**
+- ✅ MessageBrokerProtocol abstraction
+- ✅ InMemoryMessageBroker (zero-infra drop-in)
+- ✅ InMemoryAgentRepository (dict-backed)
+- ✅ LiteAgentRunner (lightweight event loop)
+- ✅ Communication Platform service + REST API
+- ✅ Multi-user demo (kathir, akilesh, aswin)
+- ✅ Entry points (run_platform, run_agent, run_multi_agent_demo)
 
 ### 🔮 Future Enhancements
+- HttpPlatformBroker (multi-process agent deployment over HTTP)
 - Browser automation (Playwright integration)
 - E-commerce adapters
 - Authentication & authorization
 - Advanced task scheduling
-- Monitoring & observability
+- Monitoring & observability (Prometheus, OpenTelemetry)
 - Multi-tenancy support
 
 ---
@@ -472,19 +577,39 @@ jarvis/app/
 ├── runtime/
 │   ├── agent.py              # Agent entity and state machine
 │   ├── task.py               # Task entity and lifecycle
-│   ├── agent_runner.py       # Event loop (main orchestration)
+│   ├── agent_runner.py       # Event loop (full — requires MongoDB/Redis)
+│   ├── lite_agent_runner.py  # Event loop (lite — zero infrastructure)
+│   ├── agent_directory.py    # Health-aware agent registry (user_id support)
+│   ├── agent_communication.py # Peer-to-peer + broadcast messaging hub
+│   ├── circuit_breaker.py    # Per-agent circuit breaker with backoff
+│   ├── delegation_context.py # Context propagation for sub-agents
+│   ├── master_agent.py       # Master agent orchestration
+│   ├── task_analyzer.py      # Task complexity analysis
+│   ├── agent_capabilities.py # Capability registry
 │   └── dag_executor.py       # Dependency resolution & parallel execution
 │
 ├── llm/
 │   ├── router.py             # LLM provider routing
 │   ├── tool_registry.py      # Tool discovery & execution
-│   ├── prompt_builder.py     # Prompt construction
+│   ├── prompt_builder.py     # Prompt construction (token-aware)
 │   ├── providers/
 │   │   ├── openai_provider.py
-│   │   └── gemini_provider.py
+│   │   ├── gemini_provider.py
+│   │   ├── anthropic_provider.py
+│   │   └── openrouter_provider.py
 │   └── tools/
 │       ├── core_tools.py     # execute_code, calculator, get_time
 │       └── web_tools.py      # web_search, read_url
+│
+├── lite/                     # Zero-infrastructure implementations
+│   ├── memory_broker.py      # In-memory message broker (asyncio)
+│   └── memory_repo.py        # In-memory agent repository (dict)
+│
+├── platform/                 # Communication Platform service
+│   ├── app.py                # FastAPI app factory
+│   ├── api.py                # REST API routes
+│   ├── service.py            # Platform business logic
+│   └── models.py             # Pydantic request/response models
 │
 ├── mcp/
 │   ├── server.py             # MCP server implementation
@@ -497,12 +622,19 @@ jarvis/app/
 │   └── mongo_client.py       # MongoDB connection
 │
 ├── messaging/
-│   └── broker.py             # Redis Pub/Sub messaging
+│   ├── broker.py             # Redis Streams messaging (production)
+│   └── broker_interface.py   # MessageBrokerProtocol abstraction
 │
 └── api/routes/
     ├── agents.py             # Agent CRUD & control
     ├── tasks.py              # Task management
     └── mcp.py                # MCP endpoints
+
+# Root entry points
+run_platform.py               # Start Communication Platform (port 9000)
+run_agent.py                   # Start single agent REPL
+run_multi_agent_demo.py        # Multi-user demo (3 agents, zero infra)
+run_gemma_agents.py            # Standalone Gemma agent demo
 ```
 
 ### Core Concepts
@@ -514,20 +646,26 @@ jarvis/app/
 5. **Tool**: Function callable by LLM for external actions
 6. **MCP**: Protocol for tool discovery and remote execution
 7. **Memory**: Short-term (buffer) + Long-term (vector embeddings)
-8. **Messaging**: Redis Pub/Sub for inter-agent communication
+8. **Messaging**: Redis Streams or InMemoryBroker for inter-agent communication
+9. **Communication Platform**: Standalone service for multi-user agent messaging
+10. **LiteAgentRunner**: Infrastructure-free agent runner for demos and development
 
 ---
 
 ## 📝 Notes for Claude AI
 
 - This is a **multi-agent orchestration platform** similar to AutoGPT/LangChain agents
-- The **agent runner event loop** is the heart of the system (agent_runner.py)
+- The **agent runner event loop** is the heart of the system — two variants:
+  - `agent_runner.py`: Full runner (requires MongoDB, Redis, Qdrant)
+  - `lite_agent_runner.py`: Lightweight runner (zero external infrastructure)
 - **Tools** are the primary way agents interact with the external world
 - **MCP** enables tool discovery from remote servers and tool sharing
-- **Phase 4** will enable multi-agent collaboration (master/sub-agent patterns)
+- **Phase 4 is complete**: Full multi-agent collaboration with peer messaging, circuit breakers, and load balancing
+- **Phase 5 is complete**: Multi-user Communication Platform with `LiteAgentRunner` and REST API
 - The system uses **async/await** throughout for non-blocking I/O
-- **MongoDB** stores persistent state, **Redis** handles real-time messaging
-- **Qdrant** provides semantic search over conversation history
+- **Full mode**: MongoDB stores persistent state, Redis handles messaging, Qdrant provides vector search
+- **Lite mode**: Everything runs in-memory — ideal for demos and local development
+- **Multi-user**: Agents are owned by users (`user_id`); the directory supports user-scoped queries
 
 ### When Making Changes
 1. Maintain async patterns throughout
@@ -546,6 +684,6 @@ jarvis/app/
 
 ---
 
-**Last Updated**: January 25, 2026
-**Version**: 0.1.0-mvp
-**Status**: Phase 3 Complete, Phase 4 Pending
+**Last Updated**: March 14, 2026
+**Version**: 0.5.0-beta
+**Status**: Phase 5 Complete — Multi-User Communication Platform
