@@ -91,10 +91,13 @@ See [PLATFORM_API.md](PLATFORM_API.md) for full API reference.
 
 - [CLAUDE.md](CLAUDE.md) — **System Overview** (architecture, components, flows)
 - [CURRENT_STATE.md](CURRENT_STATE.md) — **Current State Assessment** (module-by-module status)
+- [HLD.md](HLD.md) — **High-Level Design** (architecture, entities, decisions)
+- [LLD.md](LLD.md) — **Low-Level Design** (data models, APIs, runtime details)
 - [PLATFORM_API.md](PLATFORM_API.md) — **Communication Platform API Reference**
 - [LLM_INTEGRATION.md](LLM_INTEGRATION.md) — LLM Provider Guide
 - [MCP_SETUP.md](MCP_SETUP.md) — MCP Protocol Setup
 - [IMPLEMENTATION.md](IMPLEMENTATION.md) — Implementation Progress
+- [SETUP_PROCEDURE.md](SETUP_PROCEDURE.md) — Phase Roadmap & Quick Start
 
 ## Environment Variables
 
