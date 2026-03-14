@@ -92,6 +92,7 @@ class AgentDirectoryEntry:
     registered_at: float = field(default_factory=time.monotonic)
     metadata: dict[str, Any] = field(default_factory=dict)
     performance: AgentPerformanceStats = field(default_factory=AgentPerformanceStats)
+    user_id: str = ""
 
     @property
     def is_available(self) -> bool:
@@ -171,6 +172,7 @@ class AgentDirectory:
         capabilities: list[str] | None = None,
         max_concurrent_tasks: int = 3,
         metadata: dict[str, Any] | None = None,
+        user_id: str = "",
     ) -> AgentDirectoryEntry:
         """
         Register an agent in the directory.
@@ -181,6 +183,7 @@ class AgentDirectory:
             capabilities: List of capability IDs.
             max_concurrent_tasks: Max parallel tasks for this agent.
             metadata: Extra metadata (llm_provider, model, etc.).
+            user_id: Owning user (empty string for unowned agents).
 
         Returns:
             The created directory entry.
@@ -191,6 +194,7 @@ class AgentDirectory:
             capabilities=capabilities or [],
             max_concurrent_tasks=max_concurrent_tasks,
             metadata=metadata or {},
+            user_id=user_id,
         )
         self._entries[agent_id] = entry
         logger.info(
@@ -298,6 +302,7 @@ class AgentDirectory:
         capability: str | None = None,
         only_available: bool = False,
         agent_type: str | None = None,
+        user_id: str | None = None,
     ) -> list[AgentDirectoryEntry]:
         """
         Find all agents matching criteria.
@@ -306,6 +311,7 @@ class AgentDirectory:
             capability: Filter by capability.
             only_available: Only agents that can accept work.
             agent_type: Filter by agent type.
+            user_id: Filter by owning user (None = no filter).
 
         Returns:
             List of matching directory entries.
@@ -324,6 +330,9 @@ class AgentDirectory:
                 continue
 
             if agent_type and entry.agent_type != agent_type:
+                continue
+
+            if user_id is not None and entry.user_id != user_id:
                 continue
 
             results.append(entry)
